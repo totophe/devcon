@@ -1,6 +1,6 @@
 [package]
 name = "devcon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Bring up a dev container and drop into its shell — VS Code-free"
 license = "MIT"
