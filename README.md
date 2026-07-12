@@ -1,0 +1,147 @@
+# devcon — Dev Container Connect (VS Code-free)
+
+Bring up a project's dev container and drop into its shell — from the command
+line, without VS Code. `devcon` is the CLI counterpart to opening a project in
+an IDE: it starts the stack if it's down, runs the one-time `postCreateCommand`
+that VS Code would normally run, then `exec`s you into a shell inside the
+container.
+
+It is the evolution of [`dcon`](https://github.com/totophe/remote-code-toolbox)
+for a fully remote, terminal-first workflow.
+
+## Mental model
+
+You log into a remote host over SSH/[mosh](https://mosh.org/) and land in a
+tmux session (e.g. via [tmosh](https://github.com/totophe/tmosh)). From there:
+
+```
+tmux  (host — owned by tmosh at login)
+  └── docker exec        ← devcon: ensure the container is up + postCreate ran
+        └── your shell   ← devcon execs you in (later: zellij workspace)
+```
+
+`devcon` deliberately **does not touch the multiplexer**. It never starts its
+own tmux session, so there's no tmux-in-tmux. It just guarantees the container
+is alive and gets you inside — then gets out of the way (`exec`, no lingering
+wrapper).
+
+## What it does
+
+Run `devcon` at a project root:
+
+1. Finds `.devcontainer/` by walking up from the current directory.
+2. Parses `devcontainer.json` (JSONC — comments and trailing commas welcome).
+3. Finds the running container (via the `devcontainer.local_folder` label).
+4. **If the stack is down**, asks `Start it? [Y/n]`, then brings it up
+   (`docker compose up -d` for compose stacks, `docker run` for image-based)
+   and runs the declared `postCreateCommand` **once**.
+5. Resolves the container-side workspace directory (`docker exec -w`).
+6. Resolves which shell to use, then `exec`s `docker exec -it -w … <shell>`.
+
+## Install
+
+One line — downloads the right binary for your OS/arch into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/totophe/devcon/main/install.sh | sh
+```
+
+Environment knobs:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DEVCON_INSTALL_DIR` | `~/.local/bin` | where to put the binary |
+| `DEVCON_VERSION` | `latest` | install a specific tag, e.g. `v0.1.0` |
+
+Update in place any time:
+
+```sh
+devcon self-update
+```
+
+## Requirements
+
+- `docker`
+- A `.devcontainer/devcontainer.json` at (or above) the project root
+
+No VS Code, no Node, no `@devcontainers/cli` — `devcon` is a single static
+binary.
+
+## Usage
+
+```
+devcon                Bring the stack up (asking first) and drop into a shell
+devcon -y             Start the stack without asking if it's down
+devcon --shell /bin/bash   Override the shell for this run
+devcon self-update    Update to the latest release
+devcon --help         Show help
+```
+
+## Shell resolution
+
+`devcon` figures out which shell to drop you into, and remembers the answer:
+
+1. `--shell` flag
+2. `.devcontainer/devcon.json` (persisted from a previous run)
+3. auto-detect inside the container (`$SHELL`, then probe `zsh → bash → sh`)
+4. if detection is ambiguous, ask **once** and save the choice
+
+On the standard wellmade images this is silent — they ship `zsh`, so step 3
+resolves immediately.
+
+## Lifecycle (`postCreateCommand`)
+
+Because VS Code isn't in the loop, the lifecycle hook it normally runs never
+fires. `devcon` runs the declared `postCreateCommand` itself, **once per
+container**:
+
+- Containers `devcon` creates carry a `dev.devcon.postcreate` label.
+- Any container (including compose services it didn't create) also gets an
+  in-container sentinel at `/tmp/.devcon-postcreate-done`.
+
+On later launches, either signal makes `devcon` skip the hook. The wellmade
+`postcreate.sh` is idempotent anyway, so re-runs are harmless — the marker just
+avoids the extra work.
+
+## Configuration
+
+Per-project config lives at `.devcontainer/devcon.json`:
+
+```json
+{
+  "shell": "/bin/zsh"
+}
+```
+
+Global fallback: `~/.config/devcon/config.json`. Precedence: project over
+global; `--shell` beats both.
+
+## Codename derivation
+
+The container name (for containers `devcon` creates) is derived from the
+project path, same rule as `dcon`:
+
+| `pwd` | Codename |
+|---|---|
+| `/home/user/workspaces/totophe/devcon` | `totophe_devcon` |
+| `/home/user/workspaces/myproject` | `myproject` |
+| `/home/user/projects/myapp` | `myapp` |
+
+## Roadmap
+
+- **zellij workspace mode** — a `--workspace` flag that execs
+  `zellij attach -c <codename>` instead of a bare shell, completing the
+  `tmux → docker → zellij` vision. Parked; the machinery is already in place
+  (it only swaps the final exec command).
+
+## Building from source
+
+```sh
+cargo build --release
+cargo test --all
+cargo clippy --all-targets -- -D warnings
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
