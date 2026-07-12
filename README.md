@@ -9,6 +9,20 @@ container.
 It is the evolution of [`dcon`](https://github.com/totophe/remote-code-toolbox)
 for a fully remote, terminal-first workflow.
 
+## Quick start
+
+```sh
+# Install (downloads the right binary for your OS/arch into ~/.local/bin):
+curl -fsSL https://raw.githubusercontent.com/totophe/devcon/main/install.sh | sh
+
+# Then, from any project with a .devcontainer folder:
+cd ~/your/project
+devcon
+```
+
+`devcon` brings the stack up (asking first if it's down), runs the one-time
+`postCreateCommand`, and drops you into a shell inside the container.
+
 ## Mental model
 
 You log into a remote host over SSH/[mosh](https://mosh.org/) and land in a
@@ -40,13 +54,8 @@ Run `devcon` at a project root:
 
 ## Install
 
-One line — downloads the right binary for your OS/arch into `~/.local/bin`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/totophe/devcon/main/install.sh | sh
-```
-
-Environment knobs:
+The [Quick start](#quick-start) one-liner is all you need. The installer honors
+a couple of environment knobs:
 
 | Variable | Default | Purpose |
 |---|---|---|
