@@ -93,12 +93,13 @@ fn main() {
     );
 
     // 6. Exec into the container. On success this never returns.
-    let user = dc.remote_user.as_deref();
+    // Only pass -u if the declared remoteUser exists in this container.
+    let user = docker::resolve_user(&container, dc.remote_user.as_deref());
     eprintln!(
         "\x1b[36mdevcon:\x1b[0m connecting to {} ({workdir}) …",
         container.name
     );
-    let err = connect::shell(&container, user, &workdir, &shell);
+    let err = connect::shell(&container, user.as_deref(), &workdir, &shell);
     fail(&format!("failed to exec shell in container: {err}"));
 }
 

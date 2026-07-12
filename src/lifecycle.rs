@@ -161,15 +161,16 @@ fn bring_up_image(dc: &Devcontainer) -> Result<(), Error> {
 fn run_post_create(dc: &Devcontainer, container: &Container) -> Result<(), Error> {
     eprintln!("\x1b[36mdevcon:\x1b[0m running postCreateCommand…");
     let workdir = dc.resolved_workspace_folder();
-    let user = dc.remote_user.as_deref();
+    // Only pass -u if the declared remoteUser actually exists in the container.
+    let user = docker::resolve_user(container, dc.remote_user.as_deref());
 
     for cmd in &dc.post_create {
         let argv: Vec<&str> = match cmd {
             PostCreateCommand::Shell(s) => vec!["sh", "-c", s],
             PostCreateCommand::Argv(v) => v.iter().map(String::as_str).collect(),
         };
-        let status =
-            docker::exec_command(container, user, Some(&workdir), &argv).map_err(Error::Docker)?;
+        let status = docker::exec_command(container, user.as_deref(), Some(&workdir), &argv)
+            .map_err(Error::Docker)?;
         if !status.success() {
             return Err(Error::PostCreateFailed(describe(cmd)));
         }

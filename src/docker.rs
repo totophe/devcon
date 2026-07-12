@@ -158,6 +158,37 @@ pub fn exec_command(
         .map_err(map_spawn_err)
 }
 
+/// Resolve which user to `docker exec -u` as. Returns the declared `remoteUser`
+/// only if it actually exists in the container's passwd database; otherwise
+/// `None` (exec as the image's default user).
+///
+/// `devcontainer.json` may declare a `remoteUser` that the *running* image
+/// doesn't provide (e.g. the container was started from a different base image
+/// than the config assumes). Passing `-u <missing-user>` makes `docker exec`
+/// fail with "unable to find user … in passwd file", so we probe first.
+pub fn resolve_user(container: &Container, declared: Option<&str>) -> Option<String> {
+    let user = declared?;
+    if user_exists(container, user) {
+        Some(user.to_string())
+    } else {
+        eprintln!(
+            "\x1b[33mdevcon:\x1b[0m remoteUser '{user}' not found in container — \
+             using the image's default user instead"
+        );
+        None
+    }
+}
+
+/// True if `user` (name or numeric uid) resolves inside the container.
+fn user_exists(container: &Container, user: &str) -> bool {
+    // `id <user>` succeeds for both names and numeric uids that exist.
+    Command::new("docker")
+        .args(["exec", &container.id, "id", user])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Run `docker exec <container> <argv...>` capturing stdout (no TTY). Used for
 /// probes like `echo $SHELL`. Errors on non-zero exit.
 pub fn exec_capture(container: &Container, argv: &[&str]) -> Result<Vec<u8>, Error> {
