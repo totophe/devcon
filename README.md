@@ -98,19 +98,41 @@ devcon --help         Show help
 On the standard wellmade images this is silent — they ship `zsh`, so step 3
 resolves immediately.
 
-## Lifecycle (`postCreateCommand`)
+## Lifecycle hooks
 
-Because VS Code isn't in the loop, the lifecycle hook it normally runs never
-fires. `devcon` runs the declared `postCreateCommand` itself, **once per
-container**:
+Because VS Code isn't in the loop, the lifecycle hooks it normally runs never
+fire. `devcon` runs them itself, with the spec's timing — important because
+these dev containers `sleep infinity` and stay up across many connects, so a
+`devcon` connect is an *attach*, not a *start*.
+
+**`postCreateCommand` — once per container creation.**
 
 - Containers `devcon` creates carry a `dev.devcon.postcreate` label.
 - Any container (including compose services it didn't create) also gets an
   in-container sentinel at `/tmp/.devcon-postcreate-done`.
+- Either signal makes later launches skip it. Survives restarts.
 
-On later launches, either signal makes `devcon` skip the hook. The wellmade
-`postcreate.sh` is idempotent anyway, so re-runs are harmless — the marker just
-avoids the extra work.
+**`postStartCommand` — once per container *start*.**
+
+- Keyed on the container's `State.StartedAt` (sentinel
+  `/tmp/.devcon-poststart-<startedAt>`).
+- Skipped on re-connects to the same running container; **re-runs
+  automatically after a real `docker restart`** (new `StartedAt` → new
+  sentinel). This is what keeps start-time setup (e.g. wellmade's
+  `post-start.sh`) applied in a VS-Code-free flow.
+
+Hooks run as the declared `remoteUser` (if that user exists in the container —
+see below) in the resolved workspace folder. The wellmade scripts are
+idempotent anyway, so the markers are an optimization, not a correctness
+crutch.
+
+## remoteUser
+
+`devcon` execs as the `remoteUser` from `devcontainer.json` — but only after
+verifying that user actually exists in the running container (`id <user>`). If
+the running image doesn't provide it, `devcon` warns and falls back to the
+image's default user instead of failing with
+`unable to find user … in passwd file`.
 
 ## Configuration
 

@@ -28,21 +28,28 @@ pub struct Devcontainer {
     /// `remoteUser` — who a shell/exec should run as.
     pub remote_user: Option<String>,
     /// `postCreateCommand`, normalized to a shell-runnable list of commands.
-    pub post_create: Vec<PostCreateCommand>,
+    /// Runs once per container *creation*.
+    pub post_create: Vec<LifecycleCommand>,
+    /// `postStartCommand`, normalized. Runs once per container *start* (so it
+    /// re-runs after a restart, but not on mere re-connects).
+    pub post_start: Vec<LifecycleCommand>,
     /// `name`, purely informational.
     pub name: Option<String>,
 }
 
-/// A single `postCreateCommand`. The devcontainer spec allows a string
-/// (run via the shell), an array (argv, no shell), or an object of named
-/// commands (run in parallel; we run them sequentially for simplicity).
+/// A single lifecycle command (`postCreateCommand` / `postStartCommand`). The
+/// spec allows a string (run via the shell), an array (argv, no shell), or an
+/// object of named commands (run in parallel; we run them sequentially).
 #[derive(Debug, Clone)]
-pub enum PostCreateCommand {
+pub enum LifecycleCommand {
     /// Run through `sh -c`.
     Shell(String),
     /// Run as an argv vector, no shell interpolation.
     Argv(Vec<String>),
 }
+
+/// Back-compat alias — lifecycle commands were originally postCreate-only.
+pub use LifecycleCommand as PostCreateCommand;
 
 /// Walk upward from `start` until we find a directory containing `.devcontainer`.
 /// Returns the path of that directory (the project root), or `None` if not found.
@@ -102,6 +109,7 @@ impl Devcontainer {
             workspace_folder: parsed.workspace_folder,
             remote_user: parsed.remote_user,
             post_create: parsed.post_create_command.into_commands(),
+            post_start: parsed.post_start_command.into_commands(),
             name: parsed.name,
         })
     }
@@ -174,6 +182,8 @@ struct Raw {
     remote_user: Option<String>,
     #[serde(default, rename = "postCreateCommand")]
     post_create_command: CommandField,
+    #[serde(default, rename = "postStartCommand")]
+    post_start_command: CommandField,
 }
 
 /// `dockerComposeFile` is a string or an array of strings.

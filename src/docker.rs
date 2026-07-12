@@ -287,6 +287,19 @@ pub fn exec_command(
         .map_err(map_spawn_err)
 }
 
+/// The container's current start timestamp (`State.StartedAt`), e.g.
+/// `2026-07-12T09:14:22.123456789Z`. Changes on every (re)start, stable across
+/// connects — so it keys "has postStart run for *this* start?".
+pub fn started_at(container: &Container) -> Option<String> {
+    let out = run_docker(&["inspect", "-f", "{{.State.StartedAt}}", &container.id]).ok()?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Resolve which user to `docker exec -u` as. Returns the declared `remoteUser`
 /// only if it actually exists in the container's passwd database; otherwise
 /// `None` (exec as the image's default user).

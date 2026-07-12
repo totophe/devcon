@@ -8,12 +8,13 @@ use crate::docker::{self, Container, MARKER_SENTINEL};
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
-/// Bring the stack up if needed and ensure `postCreate` has run.
+/// Bring the stack up if needed and ensure lifecycle hooks have run.
 ///
-/// - If a container is already running: return it (running `postCreate` only
-///   if the marker is absent).
-/// - If not: prompt the user (unless `assume_yes`), bring it up, run
-///   `postCreate`, stamp the marker, and return the now-running container.
+/// Runs, in order:
+///   - `postCreateCommand` — once per container *creation* (identity-keyed
+///     label/sentinel; survives restarts).
+///   - `postStartCommand` — once per container *start* (keyed on the container's
+///     `StartedAt`, so it re-runs after a real restart but not on re-connects).
 ///
 /// Returns `Ok(None)` if the stack is down and the user declined to start it.
 pub fn ensure_up(
@@ -21,28 +22,29 @@ pub fn ensure_up(
     existing: Option<Container>,
     assume_yes: bool,
 ) -> Result<Option<Container>, Error> {
-    if let Some(container) = existing {
-        // Already up. Run postCreate once if it hasn't been marked.
-        if !docker::has_marker(&container) && !dc.post_create.is_empty() {
-            run_post_create(dc, &container)?;
+    let container = match existing {
+        Some(c) => c,
+        None => {
+            // Stack is down — ask before doing anything heavyweight.
+            if !assume_yes && !confirm_start(dc)? {
+                return Ok(None);
+            }
+            bring_up(dc)?;
+            // Re-discover the container now that it's running.
+            docker::find(dc)
+                .map_err(Error::Docker)?
+                .ok_or(Error::NotUpAfterStart)?
         }
-        return Ok(Some(container));
-    }
+    };
 
-    // Stack is down — ask before doing anything heavyweight.
-    if !assume_yes && !confirm_start(dc)? {
-        return Ok(None);
-    }
-
-    bring_up(dc)?;
-
-    // Re-discover the container now that it's running.
-    let container = docker::find(dc)
-        .map_err(Error::Docker)?
-        .ok_or(Error::NotUpAfterStart)?;
-
-    if !dc.post_create.is_empty() {
+    // postCreate: once per creation.
+    if !dc.post_create.is_empty() && !docker::has_marker(&container) {
         run_post_create(dc, &container)?;
+    }
+
+    // postStart: once per start (keyed on StartedAt).
+    if !dc.post_start.is_empty() {
+        run_post_start_if_needed(dc, &container)?;
     }
 
     Ok(Some(container))
@@ -156,15 +158,66 @@ fn bring_up_image(dc: &Devcontainer) -> Result<(), Error> {
     Ok(())
 }
 
-/// Run every `postCreateCommand`, then stamp the marker label so we never run
-/// it again for this container.
+/// Run every `postCreateCommand`, then stamp the marker so it never runs again
+/// for this container.
 fn run_post_create(dc: &Devcontainer, container: &Container) -> Result<(), Error> {
     eprintln!("\x1b[36mdevcon:\x1b[0m running postCreateCommand…");
+    run_commands(dc, container, "postCreateCommand", &dc.post_create)?;
+    stamp_marker(container)?;
+    Ok(())
+}
+
+/// Run `postStartCommand`, but only if it hasn't already run for the container's
+/// *current start*. Keyed on `State.StartedAt`, so it runs once per start and
+/// re-runs after a real restart — matching the devcontainer spec for
+/// forever-running containers, where a connect is an *attach*, not a *start*.
+fn run_post_start_if_needed(dc: &Devcontainer, container: &Container) -> Result<(), Error> {
+    let started_at = docker::started_at(container);
+    let sentinel = post_start_sentinel(started_at.as_deref());
+
+    // Already ran for this start?
+    if let Ok(status) =
+        docker::exec_status(container, &["test", "-f", &sentinel]).map_err(Error::Docker)
+    {
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    eprintln!("\x1b[36mdevcon:\x1b[0m running postStartCommand…");
+    run_commands(dc, container, "postStartCommand", &dc.post_start)?;
+
+    // Stamp this start's sentinel.
+    let touch = format!("touch {sentinel} 2>/dev/null || true");
+    let _ = docker::exec_command(container, None, None, &["sh", "-c", &touch]);
+    Ok(())
+}
+
+/// Filesystem-safe sentinel path for postStart, incorporating the container's
+/// StartedAt so it's distinct per start (and absent after a restart).
+fn post_start_sentinel(started_at: Option<&str>) -> String {
+    // Keep only alnum from the timestamp → a stable, path-safe token.
+    let token: String = started_at
+        .unwrap_or("unknown")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    format!("/tmp/.devcon-poststart-{token}")
+}
+
+/// Run a list of lifecycle commands as the (existence-checked) remoteUser, in
+/// the workspace folder. Errors on the first non-zero exit.
+fn run_commands(
+    dc: &Devcontainer,
+    container: &Container,
+    hook: &'static str,
+    commands: &[PostCreateCommand],
+) -> Result<(), Error> {
     let workdir = dc.resolved_workspace_folder();
     // Only pass -u if the declared remoteUser actually exists in the container.
     let user = docker::resolve_user(container, dc.remote_user.as_deref());
 
-    for cmd in &dc.post_create {
+    for cmd in commands {
         let argv: Vec<&str> = match cmd {
             PostCreateCommand::Shell(s) => vec!["sh", "-c", s],
             PostCreateCommand::Argv(v) => v.iter().map(String::as_str).collect(),
@@ -172,11 +225,9 @@ fn run_post_create(dc: &Devcontainer, container: &Container) -> Result<(), Error
         let status = docker::exec_command(container, user.as_deref(), Some(&workdir), &argv)
             .map_err(Error::Docker)?;
         if !status.success() {
-            return Err(Error::PostCreateFailed(describe(cmd)));
+            return Err(Error::LifecycleFailed(hook, describe(cmd)));
         }
     }
-
-    stamp_marker(container)?;
     Ok(())
 }
 
@@ -218,7 +269,8 @@ pub enum Error {
     Docker(docker::Error),
     BringUpFailed(String),
     NotUpAfterStart,
-    PostCreateFailed(String),
+    /// (hook name, the command that failed)
+    LifecycleFailed(&'static str, String),
     Io(std::io::Error),
 }
 
@@ -231,8 +283,31 @@ impl std::fmt::Display for Error {
                 f,
                 "started the stack but no matching container is running — check `docker ps`"
             ),
-            Error::PostCreateFailed(cmd) => write!(f, "postCreateCommand failed: {cmd}"),
+            Error::LifecycleFailed(hook, cmd) => write!(f, "{hook} failed: {cmd}"),
             Error::Io(e) => write!(f, "i/o error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::post_start_sentinel;
+
+    #[test]
+    fn sentinel_is_path_safe_and_start_specific() {
+        let a = post_start_sentinel(Some("2026-07-12T09:14:22.123456789Z"));
+        let b = post_start_sentinel(Some("2026-07-12T10:00:00.000000000Z"));
+        assert!(a.starts_with("/tmp/.devcon-poststart-"));
+        // The StartedAt token is alnum-only — no ':' or '.' that break paths.
+        let token = a.strip_prefix("/tmp/.devcon-poststart-").unwrap();
+        assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+        // Different starts → different sentinels (so a restart re-runs postStart).
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sentinel_handles_missing_timestamp() {
+        let s = post_start_sentinel(None);
+        assert_eq!(s, "/tmp/.devcon-poststart-unknown");
     }
 }
