@@ -23,20 +23,35 @@ pub struct Container {
     pub name: String,
 }
 
-/// Find the running Docker container associated with the given project root.
+/// One row of `docker ps` with the labels we discriminate on.
+struct PsRow {
+    id: String,
+    name: String,
+    local_folder: String,
+    compose_service: String,
+}
+
+/// Find the running Docker container that is the project's *dev container*.
 ///
-/// Strategy (in order):
-///   1. Match on the `devcontainer.local_folder` label — most reliable.
-///   2. Fall back to a name heuristic: the container name contains the
-///      last path component of the project root.
+/// This must be robust for compose stacks, where several services
+/// (`<proj>-app-1`, `<proj>-postgres-1`, …) all share the project name — only
+/// one of them is the dev container. Strategy, most reliable first:
 ///
-/// Returns `Ok(None)` when docker is reachable but no matching container is
-/// running (i.e. the stack is down).
-pub fn find(project_root: &Path) -> Result<Option<Container>, Error> {
+///   1. `devcontainer.local_folder` label == the project root (exact).
+///   2. Compose: the container whose `com.docker.compose.service` matches the
+///      dev service — the one declared in devcontainer.json, else the service
+///      whose workspace is bind-mounted at the project root.
+///   3. Name heuristic: a container name containing the project folder — but
+///      only after ruling out obvious sidecars, and preferring the declared
+///      service name if we have one.
+///
+/// Returns `Ok(None)` when docker is reachable but nothing matches (stack down).
+pub fn find(dc: &Devcontainer) -> Result<Option<Container>, Error> {
+    let project_root = &dc.project_root;
     let output = run_docker(&[
         "ps",
         "--format",
-        "{{.ID}}\t{{.Names}}\t{{.Label \"devcontainer.local_folder\"}}",
+        "{{.ID}}\t{{.Names}}\t{{.Label \"devcontainer.local_folder\"}}\t{{.Label \"com.docker.compose.service\"}}",
     ])?;
 
     let stdout = String::from_utf8_lossy(&output);
@@ -46,37 +61,151 @@ pub fn find(project_root: &Path) -> Result<Option<Container>, Error> {
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    // Pass 1: label match (exact path)
-    for line in stdout.lines() {
-        let cols: Vec<&str> = line.splitn(3, '\t').collect();
-        if cols.len() < 3 {
-            continue;
+    let rows: Vec<PsRow> = stdout
+        .lines()
+        .filter_map(|line| {
+            let c: Vec<&str> = line.splitn(4, '\t').collect();
+            if c.len() < 2 {
+                return None;
+            }
+            Some(PsRow {
+                id: c[0].to_string(),
+                name: c[1].trim().to_string(),
+                local_folder: c.get(2).map(|s| s.trim().to_string()).unwrap_or_default(),
+                compose_service: c.get(3).map(|s| s.trim().to_string()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    // Pass 1: exact devcontainer.local_folder label match.
+    if let Some(r) = rows
+        .iter()
+        .find(|r| r.local_folder == project_root_str.as_ref())
+    {
+        return Ok(Some(r.into()));
+    }
+
+    // Pass 2 (compose): match on the dev service.
+    if dc.is_compose() {
+        // The dev service: declared in json, or inferred from the compose file.
+        let service = dc.service.clone().or_else(|| infer_dev_service(dc));
+        if let Some(service) = service {
+            if let Some(r) = rows.iter().find(|r| r.compose_service == service) {
+                return Ok(Some(r.into()));
+            }
         }
-        if cols[2].trim() == project_root_str.as_ref() {
-            return Ok(Some(Container {
-                id: cols[0].to_string(),
-                name: cols[1].to_string(),
-            }));
+        // Still ambiguous: prefer a container whose workspace is bind-mounted at
+        // the project root (the dev service mounts your code; sidecars don't).
+        if let Some(r) = rows
+            .iter()
+            .filter(|r| {
+                !r.compose_service.is_empty() && name_matches_project(&r.name, project_folder)
+            })
+            .find(|r| mounts_project(&r.id, project_root))
+        {
+            return Ok(Some(r.into()));
         }
     }
 
-    // Pass 2: name heuristic — container name contains the project folder name
+    // Pass 3: name heuristic — but prefer the declared service name if any.
     if !project_folder.is_empty() {
-        for line in stdout.lines() {
-            let cols: Vec<&str> = line.splitn(3, '\t').collect();
-            if cols.len() < 2 {
-                continue;
+        if let Some(svc) = &dc.service {
+            if let Some(r) = rows
+                .iter()
+                .find(|r| r.name.contains(project_folder) && r.name.contains(svc.as_str()))
+            {
+                return Ok(Some(r.into()));
             }
-            if cols[1].trim().contains(project_folder) {
-                return Ok(Some(Container {
-                    id: cols[0].to_string(),
-                    name: cols[1].trim().to_string(),
-                }));
-            }
+        }
+        if let Some(r) = rows
+            .iter()
+            .find(|r| name_matches_project(&r.name, project_folder))
+        {
+            return Ok(Some(r.into()));
         }
     }
 
     Ok(None)
+}
+
+impl From<&PsRow> for Container {
+    fn from(r: &PsRow) -> Self {
+        Container {
+            id: r.id.clone(),
+            name: r.name.clone(),
+        }
+    }
+}
+
+fn name_matches_project(name: &str, project_folder: &str) -> bool {
+    !project_folder.is_empty() && name.contains(project_folder)
+}
+
+/// True if the container bind-mounts the project root (i.e. it's the dev
+/// service that carries your code, not a db/cache sidecar).
+fn mounts_project(container_id: &str, project_root: &Path) -> bool {
+    let tmpl = "{{range .Mounts}}{{.Source}}\n{{end}}";
+    match run_docker(&["inspect", "-f", tmpl, container_id]) {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out);
+            let root = project_root.to_string_lossy();
+            text.lines().any(|src| src.trim() == root.as_ref())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Infer the dev service from the compose file: the service whose `volumes`
+/// bind-mount into `/workspaces` (the dev container convention). Best-effort
+/// text scan — avoids a YAML dependency for a single heuristic.
+fn infer_dev_service(dc: &Devcontainer) -> Option<String> {
+    let compose_dir = dc.project_root.join(".devcontainer");
+    for rel in &dc.compose_files {
+        let path = compose_dir.join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(svc) = scan_workspace_service(&text) {
+            return Some(svc);
+        }
+    }
+    None
+}
+
+/// Scan a compose file's text for the first service that mounts into
+/// `/workspaces`. Indentation-based: services are 2-space keys under `services:`.
+fn scan_workspace_service(text: &str) -> Option<String> {
+    let mut in_services = false;
+    let mut current: Option<String> = None;
+    let mut found: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // Top-level key?
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_services = trimmed.starts_with("services:");
+            current = None;
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        // A service name is a key indented exactly 2 spaces: "  app:".
+        let indent = line.len() - line.trim_start().len();
+        if indent == 2 && trimmed.ends_with(':') {
+            current = Some(trimmed.trim().trim_end_matches(':').to_string());
+            continue;
+        }
+        // Any deeper line mentioning /workspaces marks the current service.
+        if current.is_some() && line.contains("/workspaces") {
+            found = current.clone();
+            break;
+        }
+    }
+    found
 }
 
 /// The container-side path where the workspace is mounted, read from the live
@@ -261,5 +390,68 @@ impl std::fmt::Display for Error {
             Error::CommandFailed(cmd, msg) => write!(f, "docker {cmd} failed: {msg}"),
             Error::Io(e) => write!(f, "i/o error running docker: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_workspace_service;
+
+    #[test]
+    fn finds_service_that_mounts_workspaces() {
+        let compose = r#"
+services:
+  app:
+    image: ghcr.io/wellmade-oss/dc-workbench:latest
+    volumes:
+      - .:/workspaces/wellmade-os:cached
+    command: sleep infinity
+  postgres:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+"#;
+        assert_eq!(scan_workspace_service(compose).as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn picks_the_workspace_service_even_when_not_first() {
+        let compose = r#"
+services:
+  postgres:
+    image: postgres:16
+  mailpit:
+    image: axllent/mailpit
+  app:
+    volumes:
+      - .:/workspaces/proj
+"#;
+        assert_eq!(scan_workspace_service(compose).as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn none_when_no_workspace_mount() {
+        let compose = r#"
+services:
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+"#;
+        assert_eq!(scan_workspace_service(compose), None);
+    }
+
+    #[test]
+    fn ignores_workspaces_outside_services_block() {
+        let compose = r#"
+volumes:
+  cache:
+    driver_opts:
+      device: /workspaces/whatever
+services:
+  db:
+    image: postgres:16
+"#;
+        assert_eq!(scan_workspace_service(compose), None);
     }
 }

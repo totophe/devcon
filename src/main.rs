@@ -67,7 +67,7 @@ fn main() {
     let dc = Devcontainer::load(&project_root).unwrap_or_else(|e| fail(&e.to_string()));
 
     // 2. Is the container already running?
-    let existing = docker::find(&project_root).unwrap_or_else(|e| fail(&e.to_string()));
+    let existing = docker::find(&dc).unwrap_or_else(|e| fail(&e.to_string()));
 
     // 3. Ensure it's up (prompting if needed) and postCreate has run once.
     let container = match lifecycle::ensure_up(&dc, existing, cli.yes) {

@@ -37,7 +37,7 @@ pub fn ensure_up(
     bring_up(dc)?;
 
     // Re-discover the container now that it's running.
-    let container = docker::find(&dc.project_root)
+    let container = docker::find(dc)
         .map_err(Error::Docker)?
         .ok_or(Error::NotUpAfterStart)?;
 
