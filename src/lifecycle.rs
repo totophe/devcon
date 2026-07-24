@@ -115,9 +115,7 @@ fn maybe_rebuild(
             let changed = drifted_files(dc, container);
             if changed.is_empty() {
                 false
-            } else if !assume_yes
-                && (!io::stdin().is_terminal() || !io::stderr().is_terminal())
-            {
+            } else if !assume_yes && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
                 // Non-interactive (and not -y): warn but connect anyway — never
                 // silently drop someone's container from a script.
                 let list = changed.join(", ");
@@ -239,7 +237,9 @@ fn rebuild_compose(dc: &Devcontainer) -> Result<(), Error> {
         .status()
         .map_err(map_spawn_err)?;
     if !status.success() {
-        return Err(Error::BringUpFailed("docker compose up --build failed".into()));
+        return Err(Error::BringUpFailed(
+            "docker compose up --build failed".into(),
+        ));
     }
     Ok(())
 }
@@ -257,11 +257,7 @@ fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     let day: i64 = dparts.next()?.parse().ok()?;
 
     // Time portion, dropping any fractional seconds and the trailing 'Z'.
-    let time = rest
-        .trim_end_matches('Z')
-        .split('.')
-        .next()
-        .unwrap_or(rest);
+    let time = rest.trim_end_matches('Z').split('.').next().unwrap_or(rest);
     let mut tparts = time.split(':');
     let hour: i64 = tparts.next()?.parse().ok()?;
     let min: i64 = tparts.next()?.parse().ok()?;
@@ -344,7 +340,9 @@ fn bring_down_compose(dc: &Devcontainer, mode: TearDown) -> Result<(), Error> {
         .status()
         .map_err(map_spawn_err)?;
     if !status.success() {
-        return Err(Error::BringDownFailed(format!("docker compose {verb} failed")));
+        return Err(Error::BringDownFailed(format!(
+            "docker compose {verb} failed"
+        )));
     }
     Ok(())
 }
@@ -601,10 +599,7 @@ mod tests {
         // The Unix epoch itself.
         assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
         // Fractional seconds and the trailing Z are optional.
-        assert_eq!(
-            parse_rfc3339_secs("2000-01-01T00:00:00"),
-            Some(946_684_800)
-        );
+        assert_eq!(parse_rfc3339_secs("2000-01-01T00:00:00"), Some(946_684_800));
     }
 
     #[test]
