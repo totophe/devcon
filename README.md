@@ -89,6 +89,8 @@ devcon --no-rebuild   Skip the drift check; connect to the container as-is
 devcon --shell /bin/bash   Override the shell for this run
 devcon ls             List dev-container projects on this host
 devcon ls --all       …including every compose project, not just dev containers
+devcon down           Stop this project's stack (compose down / remove container)
+devcon down --stop    Stop but keep the container(s) for a fast reconnect
 devcon self-update    Update to the latest release
 devcon --help         Show help
 ```
@@ -132,6 +134,27 @@ Hooks run as the declared `remoteUser` (if that user exists in the container —
 see below) in the resolved workspace folder. The wellmade scripts are
 idempotent anyway, so the markers are an optimization, not a correctness
 crutch.
+
+## Stopping a stack
+
+`devcon down`, from a project root, tears the stack down — the counterpart to
+the bring-up `devcon` does on connect:
+
+- **compose stacks:** `docker compose … down` (stops and removes every service
+  and the network).
+- **image-based stacks:** `docker rm -f` on the project's container.
+
+Add `--stop` (`-s`) to *stop but keep* the container(s) instead
+(`docker compose stop` / `docker stop`) — a later `devcon` reconnects to the
+same container without recreating it, which is faster and preserves any
+in-container state:
+
+```
+devcon down          # remove the stack (compose down / rm -f)
+devcon down --stop   # just stop it; reconnect later without a rebuild
+```
+
+If nothing is running, `devcon down` is a no-op with a friendly notice.
 
 ## Listing projects
 

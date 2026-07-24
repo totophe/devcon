@@ -283,6 +283,90 @@ fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
+/// How far `devcon down` tears the stack down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TearDown {
+    /// Remove the container(s) (and, for compose, the network): `compose down`
+    /// / `docker rm -f`. The default — the counterpart to bringing the stack up.
+    Remove,
+    /// Stop but keep the container(s): `compose stop` / `docker stop`. A later
+    /// `devcon` reconnects to the same container without recreating it.
+    Stop,
+}
+
+/// Bring the project's stack down. Compose stacks use `docker compose down`
+/// (or `stop`); image-based ones remove (or stop) the discovered container.
+///
+/// `existing` is the container `docker::find` located, if any. For compose,
+/// `down` works from the compose files even when we couldn't pinpoint the dev
+/// container, so a missing `existing` isn't fatal there; for image-based stacks
+/// there's nothing to do without a container.
+pub fn bring_down(
+    dc: &Devcontainer,
+    existing: Option<&Container>,
+    mode: TearDown,
+) -> Result<(), Error> {
+    if dc.is_compose() {
+        bring_down_compose(dc, mode)
+    } else {
+        match existing {
+            Some(c) => bring_down_image(c, mode),
+            None => {
+                eprintln!("\x1b[36mdevcon:\x1b[0m nothing to stop — no container is running.");
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `docker compose … down` (or `stop`) for the project's compose stack.
+/// `down` on the whole stack tears down every service + the network; `stop`
+/// leaves the containers in place. We don't scope to `runServices` here — down
+/// means down.
+fn bring_down_compose(dc: &Devcontainer, mode: TearDown) -> Result<(), Error> {
+    let verb = match mode {
+        TearDown::Remove => "down",
+        TearDown::Stop => "stop",
+    };
+    eprintln!("\x1b[36mdevcon:\x1b[0m {verb} compose stack…");
+    let compose_dir = dc.project_root.join(".devcontainer");
+
+    let mut args: Vec<String> = vec!["compose".into()];
+    for f in &dc.compose_files {
+        args.push("-f".into());
+        args.push(f.clone());
+    }
+    args.push(verb.into());
+
+    let status = Command::new("docker")
+        .args(&args)
+        .current_dir(&compose_dir)
+        .status()
+        .map_err(map_spawn_err)?;
+    if !status.success() {
+        return Err(Error::BringDownFailed(format!("docker compose {verb} failed")));
+    }
+    Ok(())
+}
+
+/// Stop or remove a single image-based container.
+fn bring_down_image(container: &Container, mode: TearDown) -> Result<(), Error> {
+    match mode {
+        TearDown::Remove => {
+            eprintln!("\x1b[36mdevcon:\x1b[0m removing {}…", container.name);
+            docker::remove(container).map_err(Error::Docker)
+        }
+        TearDown::Stop => {
+            eprintln!("\x1b[36mdevcon:\x1b[0m stopping {}…", container.name);
+            let status = docker::exec_stop(container).map_err(Error::Docker)?;
+            if !status.success() {
+                return Err(Error::BringDownFailed("docker stop failed".into()));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Bring the container up: `docker compose up -d` for compose stacks, or
 /// `docker run` for image-based ones.
 fn bring_up(dc: &Devcontainer) -> Result<(), Error> {
@@ -480,6 +564,7 @@ fn map_spawn_err(e: std::io::Error) -> Error {
 pub enum Error {
     Docker(docker::Error),
     BringUpFailed(String),
+    BringDownFailed(String),
     NotUpAfterStart,
     /// (hook name, the command that failed)
     LifecycleFailed(&'static str, String),
@@ -491,6 +576,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Docker(e) => write!(f, "{e}"),
             Error::BringUpFailed(msg) => write!(f, "failed to start the dev container: {msg}"),
+            Error::BringDownFailed(msg) => write!(f, "failed to stop the dev container: {msg}"),
             Error::NotUpAfterStart => write!(
                 f,
                 "started the stack but no matching container is running — check `docker ps`"

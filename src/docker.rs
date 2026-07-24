@@ -302,9 +302,19 @@ pub fn created_at(container: &Container) -> Option<String> {
 
 /// Force-remove a container (`docker rm -f`). Used when rebuilding an
 /// image-based stack, where recreation means tearing down the old container
-/// before `docker run` makes a fresh one.
+/// before `docker run` makes a fresh one, and by `devcon down`.
 pub fn remove(container: &Container) -> Result<(), Error> {
     run_docker(&["rm", "-f", &container.id]).map(|_| ())
+}
+
+/// Stop a container without removing it (`docker stop`). Used by
+/// `devcon down --stop`, which keeps the container so the next connect reuses
+/// it. Returns the exit status (streams docker's own progress output).
+pub fn exec_stop(container: &Container) -> Result<std::process::ExitStatus, Error> {
+    Command::new("docker")
+        .args(["stop", &container.id])
+        .status()
+        .map_err(map_spawn_err)
 }
 
 /// The container's current start timestamp (`State.StartedAt`), e.g.

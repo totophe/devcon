@@ -58,6 +58,14 @@ enum Commands {
         #[arg(short = 'a', long = "all")]
         all: bool,
     },
+    /// Stop the current project's stack (compose down / remove the container)
+    #[command(name = "down")]
+    Down {
+        /// Keep the container(s), just stop them (compose stop / docker stop),
+        /// so the next connect reuses them instead of recreating
+        #[arg(short = 's', long = "stop")]
+        stop: bool,
+    },
     /// Update devcon to the latest version
     #[command(name = "self-update")]
     SelfUpdate,
@@ -73,6 +81,10 @@ fn main() {
         }
         Some(Commands::Ls { all }) => {
             list_projects(all);
+            return;
+        }
+        Some(Commands::Down { stop }) => {
+            down_stack(stop);
             return;
         }
         None => {}
@@ -174,6 +186,26 @@ fn list_projects(all: bool) {
     if projects.iter().any(|p| p.devcon_managed) {
         eprintln!("\n\x1b[90m* created by devcon\x1b[0m");
     }
+}
+
+/// Handle `devcon down [--stop]`: locate the current project and tear its
+/// stack down (remove by default, or just stop with `--stop`).
+fn down_stack(stop: bool) {
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|e| fail(&format!("cannot determine current directory: {e}")));
+    let project_root = devcontainer::find_project_root(&cwd).unwrap_or_else(|| {
+        eprintln!("error: no .devcontainer folder found in {cwd:?} or any parent directory");
+        std::process::exit(1);
+    });
+    let dc = Devcontainer::load(&project_root).unwrap_or_else(|e| fail(&e.to_string()));
+    let existing = docker::find(&dc).unwrap_or_else(|e| fail(&e.to_string()));
+
+    let mode = if stop {
+        lifecycle::TearDown::Stop
+    } else {
+        lifecycle::TearDown::Remove
+    };
+    lifecycle::bring_down(&dc, existing.as_ref(), mode).unwrap_or_else(|e| fail(&e.to_string()));
 }
 
 fn fail(msg: &str) -> ! {
