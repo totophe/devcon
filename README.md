@@ -87,6 +87,8 @@ devcon -y             Start the stack without asking if it's down
 devcon --rebuild      Force a rebuild+recreate, then connect
 devcon --no-rebuild   Skip the drift check; connect to the container as-is
 devcon --shell /bin/bash   Override the shell for this run
+devcon ls             List dev-container projects on this host
+devcon ls --all       …including every compose project, not just dev containers
 devcon self-update    Update to the latest release
 devcon --help         Show help
 ```
@@ -130,6 +132,34 @@ Hooks run as the declared `remoteUser` (if that user exists in the container —
 see below) in the resolved workspace folder. The wellmade scripts are
 idempotent anyway, so the markers are an optimization, not a correctness
 crutch.
+
+## Listing projects
+
+`devcon ls` (alias `devcon ps`) shows the dev-container projects present on the
+host — running or stopped — by scanning containers for the labels dev
+containers carry (`devcontainer.local_folder`, the compose project, and
+devcon's own marker):
+
+```
+$ devcon ls
+up       wellmade-os   compose    (3 containers)
+up       devcon        container  *
+stopped  some-api      compose
+
+* created by devcon
+```
+
+Each row is one project: status, name, kind (a `compose` stack or a single
+`container`), and — for compose stacks — how many containers it spans. A `*`
+marks containers `devcon` itself created.
+
+By default only dev containers are listed. Add `--all` (`-a`) to include *every*
+compose project on the host, not just ones that look like dev containers.
+
+**Limitation:** a project that's fully **down** (`compose down`, or its
+container removed) has nothing to list, so it won't appear — `ls` reports
+what's *present* on the host (running or merely stopped), not every project
+that could be started.
 
 ## Rebuilding
 

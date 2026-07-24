@@ -51,6 +51,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// List dev-container projects present on this host (running or stopped)
+    #[command(name = "ls", visible_alias = "ps")]
+    Ls {
+        /// Include every compose project on the host, not just dev containers
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+    },
     /// Update devcon to the latest version
     #[command(name = "self-update")]
     SelfUpdate,
@@ -59,9 +66,16 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(Commands::SelfUpdate) = cli.command {
-        self_update::run().unwrap_or_else(|e| fail(&e.to_string()));
-        return;
+    match cli.command {
+        Some(Commands::SelfUpdate) => {
+            self_update::run().unwrap_or_else(|e| fail(&e.to_string()));
+            return;
+        }
+        Some(Commands::Ls { all }) => {
+            list_projects(all);
+            return;
+        }
+        None => {}
     }
 
     let cwd = std::env::current_dir()
@@ -119,6 +133,47 @@ fn main() {
     );
     let err = connect::shell(&container, user.as_deref(), &workdir, &shell);
     fail(&format!("failed to exec shell in container: {err}"));
+}
+
+/// Render `devcon ls`: the dev-container projects present on this host.
+fn list_projects(all: bool) {
+    let projects = docker::list_projects(all).unwrap_or_else(|e| fail(&e.to_string()));
+
+    if projects.is_empty() {
+        if all {
+            eprintln!("devcon: no containers found on this host.");
+        } else {
+            eprintln!(
+                "devcon: no dev-container projects found (pass --all to include \
+                 every compose project)."
+            );
+        }
+        return;
+    }
+
+    // Column-align on the project name.
+    let name_w = projects.iter().map(|p| p.name.len()).max().unwrap_or(0);
+    for p in &projects {
+        let status = if p.running {
+            "\x1b[32mup\x1b[0m     " // green
+        } else {
+            "\x1b[90mstopped\x1b[0m"
+        };
+        let managed = if p.devcon_managed { " *" } else { "" };
+        let count = if p.container_count > 1 {
+            format!("  ({} containers)", p.container_count)
+        } else {
+            String::new()
+        };
+        println!(
+            "{status}  {name:<name_w$}  {kind:<9}{managed}{count}",
+            name = p.name,
+            kind = p.kind,
+        );
+    }
+    if projects.iter().any(|p| p.devcon_managed) {
+        eprintln!("\n\x1b[90m* created by devcon\x1b[0m");
+    }
 }
 
 fn fail(msg: &str) -> ! {

@@ -62,7 +62,7 @@ devcon                                  # at project root
 |---|---|
 | `devcontainer` | Locate + parse `devcontainer.json`; JSONC stripping; `${…}` variable expansion; `postCreateCommand` normalization (string/array/object). |
 | `codename` | Path → stable name (ported from `dcon`). |
-| `docker` | All `docker` CLI interaction: `ps` discovery, `inspect` (mount dest, marker), `exec` (capture / status / interactive). |
+| `docker` | All `docker` CLI interaction: `ps` discovery, host-wide project listing (`list_projects`, grouped by devcontainer/compose labels), `inspect` (mount dest, marker, created-at), `exec` (capture / status / interactive), `rm -f`. |
 | `lifecycle` | Interactive "start the stack?"; compose/image bring-up; rebuild-on-drift (recreate when a stack file is newer than the container); run-once `postCreateCommand` + marker stamping. |
 | `workspace` | Resolve the `-w` directory (inspect → expand → fallback). |
 | `shell` | Resolve the shell (flag → config → detect → prompt+persist). |
@@ -103,6 +103,13 @@ upgrade.
 - **Rebuild via content hash** (drift is mtime-based today): hash the stack
   files into a label/sentinel at build time so `git clone`/`checkout` mtimes
   don't trigger a spurious rebuild prompt.
+- **`devcon down`** (not yet built): stop the current project's stack —
+  `docker compose … down` for compose, `rm -f` (via `docker::remove`) for
+  image-based. Symmetric with bring-up; the plumbing already exists.
+- **`ls` for down projects**: `devcon ls` scans containers, so a fully
+  `down` project (no container present) doesn't appear. Listing *startable*
+  projects would need a workspace-dir scan for `.devcontainer/` or a registry
+  devcon writes on connect.
 - **zellij workspace mode** (parked): `--workspace` execs
   `zellij attach -c <codename>` instead of a bare shell. Machinery is already in
   place — only the step-7 command changes.

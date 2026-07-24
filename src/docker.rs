@@ -372,6 +372,143 @@ pub fn exec_status(
         .map_err(map_spawn_err)
 }
 
+/// A dev-container project discovered on this host by scanning containers.
+/// One project may span several containers (a compose stack: app + sidecars).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Project {
+    /// Stable key: the host project path (`devcontainer.local_folder`) when
+    /// known, else the compose project name. Human-facing and used for sorting.
+    pub key: String,
+    /// A friendly display name (the path's basename, or the compose project).
+    pub name: String,
+    /// Kind of stack, for display: `"compose"` or `"container"`.
+    pub kind: &'static str,
+    /// True if at least one of the project's containers is running.
+    pub running: bool,
+    /// How many containers make up this project (all states).
+    pub container_count: usize,
+    /// True if any container carries devcon's own marker label — i.e. devcon
+    /// created it (vs. VS Code or a plain compose project).
+    pub devcon_managed: bool,
+}
+
+/// One raw row from the project-listing `docker ps -a` query.
+struct ProjectRow {
+    local_folder: String,
+    compose_project: String,
+    state: String,
+    devcon_marker: bool,
+}
+
+/// List dev-container projects present on this host (running or stopped).
+///
+/// A "project" is a group of containers sharing an identity: the host path in
+/// `devcontainer.local_folder` (VS Code and devcon image-based containers), or
+/// the `com.docker.compose.project` label (compose stacks). By default only
+/// containers that look like dev containers are counted; `all` widens the net
+/// to *every* compose project on the host.
+pub fn list_projects(all: bool) -> Result<Vec<Project>, Error> {
+    let output = run_docker(&[
+        "ps",
+        "-a",
+        "--format",
+        "{{.Label \"devcontainer.local_folder\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.State}}\t{{.Label \"dev.devcon.postcreate\"}}",
+    ])?;
+    let stdout = String::from_utf8_lossy(&output);
+    let rows = stdout.lines().filter_map(parse_project_row);
+    Ok(group_projects(rows, all))
+}
+
+/// Parse one tab-separated project-listing row. Returns `None` for blank lines.
+fn parse_project_row(line: &str) -> Option<ProjectRow> {
+    let c: Vec<&str> = line.splitn(4, '\t').collect();
+    if c.iter().all(|f| f.trim().is_empty()) {
+        return None;
+    }
+    let marker = c.get(3).map(|s| s.trim()).unwrap_or("");
+    Some(ProjectRow {
+        local_folder: c.first().map(|s| s.trim().to_string()).unwrap_or_default(),
+        compose_project: c.get(1).map(|s| s.trim().to_string()).unwrap_or_default(),
+        state: c.get(2).map(|s| s.trim().to_string()).unwrap_or_default(),
+        devcon_marker: !marker.is_empty() && marker != "<no value>",
+    })
+}
+
+/// Group container rows into projects. Pure (no docker calls) so it's testable.
+///
+/// Keying: a container with a `devcontainer.local_folder` is keyed on that path
+/// (VS Code / devcon image-based); otherwise a compose container is keyed on its
+/// `com.docker.compose.project`. When `all` is false, compose-only containers
+/// with no dev-container signal are dropped so the list stays dev-focused.
+fn group_projects(rows: impl Iterator<Item = ProjectRow>, all: bool) -> Vec<Project> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, Project> = BTreeMap::new();
+    // Track which project keys have a genuine dev-container signal on any of
+    // their containers — a compose stack's sidecars don't carry it, so we must
+    // decide "is this a dev project?" per group, not per container.
+    let mut dev_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for r in rows {
+        let has_devcontainer = !r.local_folder.is_empty();
+        let is_compose = !r.compose_project.is_empty();
+
+        if !has_devcontainer && !is_compose {
+            // A devcon-marked image container missing its local_folder label —
+            // nothing to key it on. (Shouldn't happen; devcon always sets it.)
+            continue;
+        }
+
+        // Key on the compose project when present so all of a stack's
+        // containers merge — even the dev-container member that also carries a
+        // `local_folder`. Standalone image containers key on their path.
+        let key = if is_compose {
+            r.compose_project.clone()
+        } else {
+            r.local_folder.clone()
+        };
+        // Friendly name: the project path's basename if we have one, else the
+        // compose project name.
+        let name = if has_devcontainer {
+            r.local_folder
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&r.local_folder)
+                .to_string()
+        } else {
+            r.compose_project.clone()
+        };
+        let kind = if is_compose { "compose" } else { "container" };
+
+        let running = r.state.eq_ignore_ascii_case("running");
+        let entry = map.entry(key.clone()).or_insert_with(|| Project {
+            key,
+            name: name.clone(),
+            kind,
+            running: false,
+            container_count: 0,
+            devcon_managed: false,
+        });
+        entry.container_count += 1;
+        entry.running |= running;
+        entry.devcon_managed |= r.devcon_marker;
+        // Prefer a real project-path basename over a compose-project name once
+        // any member reveals one (the dev-container member carries the path).
+        if has_devcontainer {
+            entry.name = name;
+        }
+        // A devcontainer label or devcon marker on *any* member makes the whole
+        // group a dev project.
+        if has_devcontainer || r.devcon_marker {
+            dev_keys.insert(entry.key.clone());
+        }
+    }
+
+    // Keep every group when `all`; otherwise only those with a dev signal.
+    map.into_values()
+        .filter(|p| all || dev_keys.contains(&p.key))
+        .collect()
+}
+
 /// Run a docker subcommand, capturing stdout. Errors on non-zero exit.
 fn run_docker(args: &[&str]) -> Result<Vec<u8>, Error> {
     let output = Command::new("docker")
@@ -428,7 +565,64 @@ impl std::fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_workspace_service;
+    use super::{group_projects, scan_workspace_service, ProjectRow};
+
+    fn row(local_folder: &str, compose: &str, state: &str, marker: bool) -> ProjectRow {
+        ProjectRow {
+            local_folder: local_folder.into(),
+            compose_project: compose.into(),
+            state: state.into(),
+            devcon_marker: marker,
+        }
+    }
+
+    #[test]
+    fn groups_compose_stack_into_one_project() {
+        // A compose dev container + two sidecars, all one project.
+        let rows = vec![
+            row("/home/u/proj", "proj_devcontainer", "running", false),
+            row("", "proj_devcontainer", "running", false),
+            row("", "proj_devcontainer", "exited", false),
+        ];
+        let projects = group_projects(rows.into_iter(), false);
+        assert_eq!(projects.len(), 1);
+        let p = &projects[0];
+        assert_eq!(p.name, "proj");
+        assert_eq!(p.kind, "compose");
+        assert!(p.running);
+        assert_eq!(p.container_count, 3);
+    }
+
+    #[test]
+    fn image_based_devcon_container_is_a_project() {
+        let rows = vec![row("/home/u/app", "", "running", true)];
+        let projects = group_projects(rows.into_iter(), false);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].kind, "container");
+        assert!(projects[0].devcon_managed);
+    }
+
+    #[test]
+    fn plain_compose_projects_hidden_without_all() {
+        // No devcontainer label, no devcon marker → not a dev container.
+        let hidden = group_projects(
+            vec![row("", "some_service_stack", "running", false)].into_iter(),
+            false,
+        );
+        assert!(hidden.is_empty());
+        let shown = group_projects(
+            vec![row("", "some_service_stack", "running", false)].into_iter(),
+            true,
+        );
+        assert_eq!(shown.len(), 1);
+    }
+
+    #[test]
+    fn stopped_project_reports_not_running() {
+        let rows = vec![row("/home/u/x", "", "exited", true)];
+        let projects = group_projects(rows.into_iter(), false);
+        assert!(!projects[0].running);
+    }
 
     #[test]
     fn finds_service_that_mounts_workspaces() {
