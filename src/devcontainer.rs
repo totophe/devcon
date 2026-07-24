@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 pub struct Devcontainer {
     /// The project root (the directory *containing* `.devcontainer`).
     pub project_root: PathBuf,
+    /// The `devcontainer.json` we actually parsed (flat or nested layout).
+    /// Kept so drift detection can watch it for edits.
+    pub config_file: PathBuf,
+    /// `build.dockerfile` / `dockerFile`, resolved to an absolute path if the
+    /// referenced file exists. Watched for drift on image-based stacks.
+    pub dockerfile: Option<PathBuf>,
     /// `image` field, if the container is image-based.
     pub image: Option<String>,
     /// `dockerComposeFile` entries, if the container is compose-based.
@@ -100,8 +106,19 @@ impl Devcontainer {
         let parsed: Raw = serde_json::from_str(&stripped)
             .map_err(|e| Error::Parse(path.display().to_string(), e.to_string()))?;
 
+        // The config lives in `.devcontainer/` (flat) or a subdir of it
+        // (nested); Dockerfile paths in `build.dockerfile`/`dockerFile` are
+        // relative to that same directory.
+        let config_dir = path.parent().unwrap_or(project_root).to_path_buf();
+        let dockerfile = parsed
+            .dockerfile()
+            .map(|rel| config_dir.join(rel))
+            .filter(|p| p.is_file());
+
         Ok(Self {
             project_root: project_root.to_path_buf(),
+            config_file: path,
+            dockerfile,
             image: parsed.image,
             compose_files: parsed.docker_compose_file.into_vec(),
             service: parsed.service,
@@ -117,6 +134,24 @@ impl Devcontainer {
     /// True when the container is defined by a docker-compose file.
     pub fn is_compose(&self) -> bool {
         !self.compose_files.is_empty()
+    }
+
+    /// The set of files that *define* the stack — editing any of them means the
+    /// running container is out of date. Used for rebuild drift detection:
+    /// `devcontainer.json`, every referenced compose file, and the Dockerfile
+    /// (if the config points at one that exists). Paths are absolute and only
+    /// existing files are returned.
+    pub fn stack_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![self.config_file.clone()];
+        let compose_dir = self.project_root.join(".devcontainer");
+        for rel in &self.compose_files {
+            files.push(compose_dir.join(rel));
+        }
+        if let Some(df) = &self.dockerfile {
+            files.push(df.clone());
+        }
+        files.retain(|p| p.is_file());
+        files
     }
 
     /// Resolve `workspaceFolder` with devcontainer variables expanded.
@@ -184,6 +219,30 @@ struct Raw {
     post_create_command: CommandField,
     #[serde(default, rename = "postStartCommand")]
     post_start_command: CommandField,
+    /// Modern form: `"build": { "dockerfile": "Dockerfile", ... }`.
+    #[serde(default)]
+    build: Option<Build>,
+    /// Legacy top-level form: `"dockerFile": "Dockerfile"`.
+    #[serde(default, rename = "dockerFile")]
+    docker_file: Option<String>,
+}
+
+/// The `build` object; we only need the Dockerfile path for drift detection.
+#[derive(Deserialize)]
+struct Build {
+    #[serde(default)]
+    dockerfile: Option<String>,
+}
+
+impl Raw {
+    /// The Dockerfile path this config references (relative to `.devcontainer/`),
+    /// preferring the modern `build.dockerfile` over the legacy `dockerFile`.
+    fn dockerfile(&self) -> Option<&str> {
+        self.build
+            .as_ref()
+            .and_then(|b| b.dockerfile.as_deref())
+            .or(self.docker_file.as_deref())
+    }
 }
 
 /// `dockerComposeFile` is a string or an array of strings.

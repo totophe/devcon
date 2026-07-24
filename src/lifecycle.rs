@@ -6,11 +6,28 @@
 use crate::devcontainer::{Devcontainer, PostCreateCommand};
 use crate::docker::{self, Container, MARKER_SENTINEL};
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::process::Command;
+use std::time::UNIX_EPOCH;
+
+/// How the caller wants rebuild-on-drift handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rebuild {
+    /// Detect drift (a stack file edited since the container was built) and
+    /// prompt before recreating. This is the default.
+    Auto,
+    /// Always recreate the container, regardless of drift (`--rebuild`).
+    Force,
+    /// Never recreate; connect to whatever is running (`--no-rebuild`).
+    Never,
+}
 
 /// Bring the stack up if needed and ensure lifecycle hooks have run.
 ///
 /// Runs, in order:
+///   - rebuild-on-drift — if the running container predates an edit to a stack
+///     file (`devcontainer.json`, a compose file, the Dockerfile), recreate it
+///     so the change takes effect (prompting first, unless forced).
 ///   - `postCreateCommand` — once per container *creation* (identity-keyed
 ///     label/sentinel; survives restarts).
 ///   - `postStartCommand` — once per container *start* (keyed on the container's
@@ -21,9 +38,16 @@ pub fn ensure_up(
     dc: &Devcontainer,
     existing: Option<Container>,
     assume_yes: bool,
+    rebuild: Rebuild,
 ) -> Result<Option<Container>, Error> {
     let container = match existing {
-        Some(c) => c,
+        Some(c) => {
+            // Container is up: recreate it if the stack drifted (or was forced).
+            match maybe_rebuild(dc, &c, assume_yes, rebuild)? {
+                Some(fresh) => fresh,
+                None => c,
+            }
+        }
         None => {
             // Stack is down — ask before doing anything heavyweight.
             if !assume_yes && !confirm_start(dc)? {
@@ -69,6 +93,194 @@ fn confirm_start(dc: &Devcontainer) -> Result<bool, Error> {
     io::stdin().read_line(&mut line).map_err(Error::Io)?;
     let answer = line.trim().to_lowercase();
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
+}
+
+/// Recreate the running container when the stack has drifted (or a rebuild was
+/// forced). Returns `Some(fresh_container)` if a rebuild happened, `None` if we
+/// left the existing container in place.
+///
+/// Drift = any stack-defining file (`devcontainer.json`, a compose file, the
+/// Dockerfile) has an mtime newer than the container's creation time. This is
+/// devcon's stand-in for VS Code's "Rebuild Container".
+fn maybe_rebuild(
+    dc: &Devcontainer,
+    container: &Container,
+    assume_yes: bool,
+    rebuild: Rebuild,
+) -> Result<Option<Container>, Error> {
+    let do_rebuild = match rebuild {
+        Rebuild::Never => false,
+        Rebuild::Force => true,
+        Rebuild::Auto => {
+            let changed = drifted_files(dc, container);
+            if changed.is_empty() {
+                false
+            } else if !assume_yes
+                && (!io::stdin().is_terminal() || !io::stderr().is_terminal())
+            {
+                // Non-interactive (and not -y): warn but connect anyway — never
+                // silently drop someone's container from a script.
+                let list = changed.join(", ");
+                eprintln!(
+                    "\x1b[33mdevcon:\x1b[0m {list} changed since this container was built — \
+                     run `devcon --rebuild` to recreate it."
+                );
+                false
+            } else {
+                assume_yes || confirm_rebuild(&changed)?
+            }
+        }
+    };
+
+    if !do_rebuild {
+        return Ok(None);
+    }
+
+    rebuild_stack(dc, container)?;
+    let fresh = docker::find(dc)
+        .map_err(Error::Docker)?
+        .ok_or(Error::NotUpAfterStart)?;
+    Ok(Some(fresh))
+}
+
+/// The stack files whose mtime is newer than the container's creation time.
+/// Empty when the container is up to date (or when we can't read `.Created`,
+/// in which case we conservatively report no drift rather than nag).
+fn drifted_files(dc: &Devcontainer, container: &Container) -> Vec<String> {
+    let Some(created) = docker::created_at(container).and_then(|s| parse_rfc3339_secs(&s)) else {
+        return Vec::new();
+    };
+    dc.stack_files()
+        .into_iter()
+        .filter(|f| file_newer_than(f, created))
+        .map(|f| display_relative(&f, &dc.project_root))
+        .collect()
+}
+
+/// True if `path`'s mtime is strictly after `created` (Unix seconds).
+fn file_newer_than(path: &Path, created: i64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    match mtime.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64) > created,
+        Err(_) => false,
+    }
+}
+
+/// Present a stack file relative to the project root when possible, for a
+/// tidier message (`.devcontainer/docker-compose.yml` beats an absolute path).
+fn display_relative(path: &Path, project_root: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Interactive rebuild prompt on stderr. Defaults to **No** — recreating drops
+/// the container, so we only proceed on an explicit yes.
+fn confirm_rebuild(changed: &[String]) -> Result<bool, Error> {
+    let list = changed.join(", ");
+    let mut err = io::stderr();
+    let _ = write!(
+        err,
+        "\x1b[36mdevcon:\x1b[0m {list} changed since this container was built. \
+         Rebuild it? [y/N] "
+    );
+    let _ = err.flush();
+
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).map_err(Error::Io)?;
+    let answer = line.trim().to_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+/// Recreate the container so stack changes take effect. Compose stacks rebuild
+/// their image and force-recreate in place; image-based stacks are removed and
+/// re-run. Either way the fresh container has no run-once markers, so
+/// `postCreateCommand`/`postStartCommand` re-run naturally afterward.
+fn rebuild_stack(dc: &Devcontainer, container: &Container) -> Result<(), Error> {
+    eprintln!("\x1b[36mdevcon:\x1b[0m rebuilding…");
+    if dc.is_compose() {
+        rebuild_compose(dc)
+    } else {
+        docker::remove(container).map_err(Error::Docker)?;
+        bring_up_image(dc)
+    }
+}
+
+/// `docker compose up -d --build --force-recreate` for the dev service(s).
+/// `--build` picks up Dockerfile edits; `--force-recreate` picks up compose /
+/// devcontainer.json edits even when the image is unchanged.
+fn rebuild_compose(dc: &Devcontainer) -> Result<(), Error> {
+    let compose_dir = dc.project_root.join(".devcontainer");
+
+    let mut args: Vec<String> = vec!["compose".into()];
+    for f in &dc.compose_files {
+        args.push("-f".into());
+        args.push(f.clone());
+    }
+    args.push("up".into());
+    args.push("-d".into());
+    args.push("--build".into());
+    args.push("--force-recreate".into());
+    if !dc.run_services.is_empty() {
+        args.extend(dc.run_services.iter().cloned());
+    } else if let Some(svc) = &dc.service {
+        args.push(svc.clone());
+    }
+
+    let status = Command::new("docker")
+        .args(&args)
+        .current_dir(&compose_dir)
+        .status()
+        .map_err(map_spawn_err)?;
+    if !status.success() {
+        return Err(Error::BringUpFailed("docker compose up --build failed".into()));
+    }
+    Ok(())
+}
+
+/// Parse a Docker `.Created`/RFC3339 UTC timestamp
+/// (`YYYY-MM-DDTHH:MM:SS[.fff…]Z`) to Unix epoch seconds. Docker always emits
+/// UTC with a `Z` suffix, so we don't handle numeric offsets. Returns `None`
+/// on any shape we don't recognize (caller treats that as "no drift").
+fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once('T')?;
+    let mut dparts = date.split('-');
+    let year: i64 = dparts.next()?.parse().ok()?;
+    let month: i64 = dparts.next()?.parse().ok()?;
+    let day: i64 = dparts.next()?.parse().ok()?;
+
+    // Time portion, dropping any fractional seconds and the trailing 'Z'.
+    let time = rest
+        .trim_end_matches('Z')
+        .split('.')
+        .next()
+        .unwrap_or(rest);
+    let mut tparts = time.split(':');
+    let hour: i64 = tparts.next()?.parse().ok()?;
+    let min: i64 = tparts.next()?.parse().ok()?;
+    let sec: i64 = tparts.next()?.parse().ok()?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Days from the Unix epoch (1970-01-01) to this date, via a civil-calendar
+    // algorithm (Howard Hinnant's days_from_civil) — no leap-year edge cases.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468;
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 /// Bring the container up: `docker compose up -d` for compose stacks, or
@@ -291,7 +503,30 @@ impl std::fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::post_start_sentinel;
+    use super::{parse_rfc3339_secs, post_start_sentinel};
+
+    #[test]
+    fn parses_docker_created_timestamp() {
+        // 2026-07-12T09:14:22Z — cross-checked against a known epoch value.
+        assert_eq!(
+            parse_rfc3339_secs("2026-07-12T09:14:22.123456789Z"),
+            Some(1_783_847_662)
+        );
+        // The Unix epoch itself.
+        assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+        // Fractional seconds and the trailing Z are optional.
+        assert_eq!(
+            parse_rfc3339_secs("2000-01-01T00:00:00"),
+            Some(946_684_800)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_timestamps() {
+        assert_eq!(parse_rfc3339_secs("not-a-date"), None);
+        assert_eq!(parse_rfc3339_secs("2026-13-01T00:00:00Z"), None); // bad month
+        assert_eq!(parse_rfc3339_secs(""), None);
+    }
 
     #[test]
     fn sentinel_is_path_safe_and_start_specific() {

@@ -49,8 +49,11 @@ Run `devcon` at a project root:
 4. **If the stack is down**, asks `Start it? [Y/n]`, then brings it up
    (`docker compose up -d` for compose stacks, `docker run` for image-based)
    and runs the declared `postCreateCommand` **once**.
-5. Resolves the container-side workspace directory (`docker exec -w`).
-6. Resolves which shell to use, then `exec`s `docker exec -it -w … <shell>`.
+5. **If the stack is up but a stack file changed** (`devcontainer.json`, a
+   compose file, or the Dockerfile) since the container was built, asks
+   `Rebuild it? [y/N]` and recreates it (see [Rebuilding](#rebuilding)).
+6. Resolves the container-side workspace directory (`docker exec -w`).
+7. Resolves which shell to use, then `exec`s `docker exec -it -w … <shell>`.
 
 ## Install
 
@@ -81,6 +84,8 @@ binary.
 ```
 devcon                Bring the stack up (asking first) and drop into a shell
 devcon -y             Start the stack without asking if it's down
+devcon --rebuild      Force a rebuild+recreate, then connect
+devcon --no-rebuild   Skip the drift check; connect to the container as-is
 devcon --shell /bin/bash   Override the shell for this run
 devcon self-update    Update to the latest release
 devcon --help         Show help
@@ -125,6 +130,56 @@ Hooks run as the declared `remoteUser` (if that user exists in the container —
 see below) in the resolved workspace folder. The wellmade scripts are
 idempotent anyway, so the markers are an optimization, not a correctness
 crutch.
+
+## Rebuilding
+
+VS Code offers a **Rebuild Container** command when you change the stack
+definition. `devcon` gives you the same thing, automatically.
+
+Each time you connect, `devcon` compares the mtime of the stack-defining files
+against the running container's creation time:
+
+- `.devcontainer/devcontainer.json`
+- every `dockerComposeFile`
+- the `Dockerfile` referenced by `build.dockerfile` (or the legacy `dockerFile`)
+
+If any of them is **newer than the container**, the stack has *drifted* — the
+container no longer reflects its definition — and `devcon` asks:
+
+```
+devcon: .devcontainer/docker-compose.yml changed since this container was
+        built. Rebuild it? [y/N]
+```
+
+The default is **No** (rebuilding drops and recreates the container, so it's
+opt-in). On yes:
+
+- **compose stacks:** `docker compose … up -d --build --force-recreate` —
+  `--build` picks up Dockerfile edits, `--force-recreate` picks up compose /
+  `devcontainer.json` edits even when the image is unchanged.
+- **image-based stacks:** the old container is `docker rm -f`'d and re-run.
+
+Either way the fresh container starts with no run-once markers, so
+`postCreateCommand` (and `postStartCommand`) re-run on it automatically.
+
+Flags:
+
+| Flag | Effect |
+|---|---|
+| *(none)* | Detect drift and prompt (the default). |
+| `--rebuild` | Always recreate, even with no drift. |
+| `--no-rebuild` | Never recreate; connect as-is, no prompt. |
+
+In a non-interactive context (piped, no TTY) `devcon` never drops a container
+behind your back: it prints a one-line notice that the stack changed and
+connects to the existing container. Pass `--rebuild` (or `-y`) to opt in from a
+script.
+
+**Caveat — fresh clones.** Drift is detected by file mtime, and `git clone` /
+`git checkout` stamps files with the checkout time. So on a freshly cloned repo
+whose container was built earlier, the stack files can look "newer" and trigger
+a spurious prompt. The prompt defaults to No and `--no-rebuild` silences it; a
+content-hash marker (immune to this) is a candidate future upgrade.
 
 ## remoteUser
 
@@ -172,6 +227,8 @@ cargo build --release
 cargo test --all
 cargo clippy --all-targets -- -D warnings
 ```
+
+See [docs/plan.md](docs/plan.md) for the design and module layout.
 
 ## License
 

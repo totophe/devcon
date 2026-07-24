@@ -287,6 +287,26 @@ pub fn exec_command(
         .map_err(map_spawn_err)
 }
 
+/// The container's creation timestamp (`.Created`), e.g.
+/// `2026-07-12T09:14:22.123456789Z`. Stable for the life of the container —
+/// used as the baseline for rebuild drift detection (is any stack file newer?).
+pub fn created_at(container: &Container) -> Option<String> {
+    let out = run_docker(&["inspect", "-f", "{{.Created}}", &container.id]).ok()?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Force-remove a container (`docker rm -f`). Used when rebuilding an
+/// image-based stack, where recreation means tearing down the old container
+/// before `docker run` makes a fresh one.
+pub fn remove(container: &Container) -> Result<(), Error> {
+    run_docker(&["rm", "-f", &container.id]).map(|_| ())
+}
+
 /// The container's current start timestamp (`State.StartedAt`), e.g.
 /// `2026-07-12T09:14:22.123456789Z`. Changes on every (re)start, stable across
 /// connects — so it keys "has postStart run for *this* start?".

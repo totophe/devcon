@@ -63,7 +63,7 @@ devcon                                  # at project root
 | `devcontainer` | Locate + parse `devcontainer.json`; JSONC stripping; `${…}` variable expansion; `postCreateCommand` normalization (string/array/object). |
 | `codename` | Path → stable name (ported from `dcon`). |
 | `docker` | All `docker` CLI interaction: `ps` discovery, `inspect` (mount dest, marker), `exec` (capture / status / interactive). |
-| `lifecycle` | Interactive "start the stack?"; compose/image bring-up; run-once `postCreateCommand` + marker stamping. |
+| `lifecycle` | Interactive "start the stack?"; compose/image bring-up; rebuild-on-drift (recreate when a stack file is newer than the container); run-once `postCreateCommand` + marker stamping. |
 | `workspace` | Resolve the `-w` directory (inspect → expand → fallback). |
 | `shell` | Resolve the shell (flag → config → detect → prompt+persist). |
 | `config` | Load/merge/persist `.devcontainer/devcon.json` + global. |
@@ -85,8 +85,24 @@ marker is two-pronged:
 `postcreate.sh` is idempotent, a missed marker only costs a redundant (safe)
 re-run.
 
+## Rebuild on drift
+
+Mirrors VS Code's "Rebuild Container". On connect, `lifecycle` compares the
+mtime of the stack-defining files — `devcontainer.json`, every compose file,
+and the referenced Dockerfile (`build.dockerfile` / `dockerFile`) — against the
+container's `.Created` timestamp. If any is newer, the stack has drifted and
+`devcon` prompts (default **No**) to recreate: `up -d --build --force-recreate`
+for compose, `rm -f` + re-`run` for image-based. The fresh container has no
+run-once markers, so `postCreate`/`postStart` re-run naturally. `--rebuild`
+forces it, `--no-rebuild` suppresses it. Drift uses mtime, so fresh clones
+(checkout-time mtimes) can false-positive — a content hash would be the robust
+upgrade.
+
 ## Open questions / future work
 
+- **Rebuild via content hash** (drift is mtime-based today): hash the stack
+  files into a label/sentinel at build time so `git clone`/`checkout` mtimes
+  don't trigger a spurious rebuild prompt.
 - **zellij workspace mode** (parked): `--workspace` execs
   `zellij attach -c <codename>` instead of a bare shell. Machinery is already in
   place — only the step-7 command changes.

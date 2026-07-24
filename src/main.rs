@@ -37,6 +37,16 @@ struct Cli {
     /// Start the stack without asking if it isn't running
     #[arg(short = 'y', long = "yes")]
     yes: bool,
+
+    /// Recreate the container even if nothing changed (like VS Code's "Rebuild
+    /// Container"). Rebuilds the image and re-runs postCreate.
+    #[arg(long = "rebuild", conflicts_with = "no_rebuild")]
+    rebuild: bool,
+
+    /// Never recreate on drift — connect to the running container as-is,
+    /// suppressing the "stack changed, rebuild?" prompt.
+    #[arg(long = "no-rebuild")]
+    no_rebuild: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -69,8 +79,16 @@ fn main() {
     // 2. Is the container already running?
     let existing = docker::find(&dc).unwrap_or_else(|e| fail(&e.to_string()));
 
-    // 3. Ensure it's up (prompting if needed) and postCreate has run once.
-    let container = match lifecycle::ensure_up(&dc, existing, cli.yes) {
+    // 3. Ensure it's up (prompting if needed), rebuilt if the stack drifted,
+    //    and postCreate has run once.
+    let rebuild = if cli.rebuild {
+        lifecycle::Rebuild::Force
+    } else if cli.no_rebuild {
+        lifecycle::Rebuild::Never
+    } else {
+        lifecycle::Rebuild::Auto
+    };
+    let container = match lifecycle::ensure_up(&dc, existing, cli.yes, rebuild) {
         Ok(Some(c)) => c,
         Ok(None) => {
             // User declined to start the stack — bow out to the shell quietly.
