@@ -47,6 +47,10 @@ struct Cli {
     /// suppressing the "stack changed, rebuild?" prompt.
     #[arg(long = "no-rebuild")]
     no_rebuild: bool,
+
+    /// Print version (a lowercase alias for the default -V/--version)
+    #[arg(short = 'v', action = clap::ArgAction::Version)]
+    version_alias: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]
