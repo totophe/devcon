@@ -592,6 +592,89 @@ fn group_projects(rows: impl Iterator<Item = ProjectRow>, all: bool) -> Vec<Proj
         .collect()
 }
 
+/// One `docker ps -a` row used to explain why nothing is running.
+struct DiagRow {
+    name: String,
+    running: bool,
+    compose_service: String,
+    local_folder: String,
+    /// Truncated `{{.Command}}` from `docker ps` (quoted).
+    command: String,
+}
+
+/// Explain why [`find`] turned up nothing running right after a bring-up.
+///
+/// The usual culprit for a compose stack: the dev service has no long-running
+/// command (e.g. `command: zsh -l`), so under `compose up -d` it runs and exits
+/// immediately. devcon's model needs the container to stay alive so it can
+/// `docker exec` a shell into it. If we can spot the project's stopped dev
+/// service, return a message naming it and its command; otherwise `None` (the
+/// caller falls back to the generic "nothing is running" error).
+pub fn diagnose_not_running(dc: &Devcontainer) -> Option<String> {
+    let out = run_docker(&[
+        "ps",
+        "-a",
+        "--format",
+        "{{.Names}}\t{{.State}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"devcontainer.local_folder\"}}\t{{.Command}}",
+    ])
+    .ok()?;
+    let stdout = String::from_utf8_lossy(&out);
+    let rows: Vec<DiagRow> = stdout.lines().filter_map(parse_diag_row).collect();
+
+    let dev_service = dc.service.clone().or_else(|| infer_dev_service(dc));
+    let project_root = dc.project_root.to_string_lossy().into_owned();
+    let row = pick_stopped_dev_container(&rows, dev_service.as_deref(), &project_root)?;
+
+    let cmd = row.command.trim().trim_matches('"');
+    let cmd = if cmd.is_empty() {
+        "the image's default command".to_string()
+    } else {
+        format!("`{cmd}`")
+    };
+    Some(format!(
+        "the dev container '{}' started but exited immediately (command: {cmd}). \
+         A compose dev service must stay running for devcon to exec into it — \
+         give it a long-running command such as `command: sleep infinity` \
+         (or set `tty: true` and `stdin_open: true`).",
+        row.name,
+    ))
+}
+
+fn parse_diag_row(line: &str) -> Option<DiagRow> {
+    let c: Vec<&str> = line.splitn(5, '\t').collect();
+    if c.len() < 2 || c.iter().all(|f| f.trim().is_empty()) {
+        return None;
+    }
+    Some(DiagRow {
+        name: c[0].trim().to_string(),
+        running: c
+            .get(1)
+            .map(|s| s.trim().eq_ignore_ascii_case("running"))
+            .unwrap_or(false),
+        compose_service: c.get(2).map(|s| s.trim().to_string()).unwrap_or_default(),
+        local_folder: c.get(3).map(|s| s.trim().to_string()).unwrap_or_default(),
+        command: c.get(4).map(|s| s.trim().to_string()).unwrap_or_default(),
+    })
+}
+
+/// Pure: pick the project's dev-service container that is *stopped*, so we can
+/// explain an immediate exit. Matches on the compose service name or the
+/// project's `local_folder`; skips running and unrelated containers.
+fn pick_stopped_dev_container<'a>(
+    rows: &'a [DiagRow],
+    dev_service: Option<&str>,
+    project_root: &str,
+) -> Option<&'a DiagRow> {
+    rows.iter().find(|r| {
+        if r.running {
+            return false;
+        }
+        let by_service = dev_service.map(|s| r.compose_service == s).unwrap_or(false);
+        let by_folder = !r.local_folder.is_empty() && r.local_folder == project_root;
+        by_service || by_folder
+    })
+}
+
 /// Run a docker subcommand, capturing stdout. Errors on non-zero exit.
 fn run_docker(args: &[&str]) -> Result<Vec<u8>, Error> {
     let output = Command::new("docker")
@@ -648,7 +731,10 @@ impl std::fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_projects, row_stack_matches, scan_workspace_service, ProjectRow, PsRow};
+    use super::{
+        group_projects, pick_stopped_dev_container, row_stack_matches, scan_workspace_service,
+        DiagRow, ProjectRow, PsRow,
+    };
     use crate::devcontainer::Devcontainer;
     use std::path::PathBuf;
 
@@ -794,6 +880,49 @@ mod tests {
             false,
         );
         assert_eq!(projects[0].path, "/home/u/proj");
+    }
+
+    fn diag(name: &str, running: bool, service: &str, folder: &str, command: &str) -> DiagRow {
+        DiagRow {
+            name: name.into(),
+            running,
+            compose_service: service.into(),
+            local_folder: folder.into(),
+            command: command.into(),
+        }
+    }
+
+    #[test]
+    fn diagnoses_the_stopped_dev_service_not_a_running_sidecar() {
+        let rows = vec![
+            diag(
+                "deploy-postgres-1",
+                true,
+                "postgres",
+                "",
+                "docker-entrypoint",
+            ),
+            diag("deploy-workbench-1", false, "workbench", "", "\"zsh -l\""),
+        ];
+        // The dev service (workbench) exited; postgres is a running sidecar.
+        let pick = pick_stopped_dev_container(&rows, Some("workbench"), "/home/u/proj");
+        assert_eq!(pick.map(|r| r.name.as_str()), Some("deploy-workbench-1"));
+
+        // A running dev service is not something to blame.
+        assert!(pick_stopped_dev_container(&rows[..1], Some("postgres"), "/x").is_none());
+
+        // Image-based fallback: match on local_folder when there's no service.
+        let img = vec![diag(
+            "devcon-proj",
+            false,
+            "",
+            "/home/u/proj",
+            "sleep infinity",
+        )];
+        assert_eq!(
+            pick_stopped_dev_container(&img, None, "/home/u/proj").map(|r| r.name.as_str()),
+            Some("devcon-proj"),
+        );
     }
 
     #[test]

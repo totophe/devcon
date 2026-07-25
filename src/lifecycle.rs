@@ -57,18 +57,25 @@ pub fn ensure_up(
             // Re-discover the container now that it's running.
             docker::find(dc)
                 .map_err(Error::Docker)?
-                .ok_or(Error::NotUpAfterStart)?
+                .ok_or_else(|| Error::NotUpAfterStart(docker::diagnose_not_running(dc)))?
         }
     };
 
-    // postCreate: once per creation.
+    // postCreate: once per creation. A hook failure is warned, NOT fatal — a
+    // broken postCreate must not lock you out of an otherwise-healthy container.
+    // The marker is only stamped on success (inside run_post_create), so it
+    // retries on the next connect.
     if !dc.post_create.is_empty() && !docker::has_marker(&container) {
-        run_post_create(dc, &container)?;
+        if let Err(e) = run_post_create(dc, &container) {
+            warn_lifecycle(&e);
+        }
     }
 
-    // postStart: once per start (keyed on StartedAt).
+    // postStart: once per start (keyed on StartedAt). Also non-fatal.
     if !dc.post_start.is_empty() {
-        run_post_start_if_needed(dc, &container)?;
+        if let Err(e) = run_post_start_if_needed(dc, &container) {
+            warn_lifecycle(&e);
+        }
     }
 
     Ok(Some(container))
@@ -160,7 +167,7 @@ fn maybe_rebuild(
     rebuild_stack(dc, container, existing_compose)?;
     let fresh = docker::find(dc)
         .map_err(Error::Docker)?
-        .ok_or(Error::NotUpAfterStart)?;
+        .ok_or_else(|| Error::NotUpAfterStart(docker::diagnose_not_running(dc)))?;
     Ok(Some(fresh))
 }
 
@@ -624,6 +631,16 @@ fn describe(cmd: &PostCreateCommand) -> String {
     }
 }
 
+/// Report a lifecycle-hook failure without aborting. devcon still connects, so
+/// a broken `postCreateCommand`/`postStartCommand` can't lock you out of the
+/// container. The unstamped marker means the hook retries on the next connect.
+fn warn_lifecycle(e: &Error) {
+    eprintln!(
+        "\x1b[33mdevcon:\x1b[0m {e} — connecting anyway; it will retry on the next \
+         connect once the cause is fixed."
+    );
+}
+
 fn map_spawn_err(e: std::io::Error) -> Error {
     if e.kind() == std::io::ErrorKind::NotFound {
         Error::Docker(docker::Error::DockerNotFound)
@@ -637,7 +654,10 @@ pub enum Error {
     Docker(docker::Error),
     BringUpFailed(String),
     BringDownFailed(String),
-    NotUpAfterStart,
+    /// Nothing is running after a bring-up. The optional string is a specific
+    /// diagnosis (e.g. the dev service exited immediately); `None` falls back to
+    /// a generic message.
+    NotUpAfterStart(Option<String>),
     /// (hook name, the command that failed)
     LifecycleFailed(&'static str, String),
     Io(std::io::Error),
@@ -649,7 +669,8 @@ impl std::fmt::Display for Error {
             Error::Docker(e) => write!(f, "{e}"),
             Error::BringUpFailed(msg) => write!(f, "failed to start the dev container: {msg}"),
             Error::BringDownFailed(msg) => write!(f, "failed to stop the dev container: {msg}"),
-            Error::NotUpAfterStart => write!(
+            Error::NotUpAfterStart(Some(detail)) => write!(f, "{detail}"),
+            Error::NotUpAfterStart(None) => write!(
                 f,
                 "started the stack but no matching container is running — check `docker ps`"
             ),
