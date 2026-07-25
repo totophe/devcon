@@ -40,12 +40,13 @@ pub fn ensure_up(
     assume_yes: bool,
     rebuild: Rebuild,
 ) -> Result<Option<Container>, Error> {
-    let container = match existing {
+    let (container, created) = match existing {
         Some(c) => {
             // Container is up: recreate it if the stack drifted (or was forced).
+            // A rebuild counts as a fresh creation for the steps below.
             match maybe_rebuild(dc, &c, assume_yes, rebuild)? {
-                Some(fresh) => fresh,
-                None => c,
+                Some(fresh) => (fresh, true),
+                None => (c, false),
             }
         }
         None => {
@@ -55,16 +56,21 @@ pub fn ensure_up(
             }
             bring_up(dc)?;
             // Re-discover the container now that it's running.
-            docker::find(dc)
+            let c = docker::find(dc)
                 .map_err(Error::Docker)?
-                .ok_or_else(|| Error::NotUpAfterStart(docker::diagnose_not_running(dc)))?
+                .ok_or_else(|| Error::NotUpAfterStart(docker::diagnose_not_running(dc)))?;
+            (c, true)
         }
     };
 
     // Align the container user's uid/gid to the host user's BEFORE postCreate,
-    // so hooks (and you) write into a correctly-owned home and workspace. No-op
-    // when disabled/non-Linux/root/already-aligned; non-fatal on error.
-    align_user_uid(dc, &container);
+    // but ONLY on a freshly created/recreated container. On a plain reconnect
+    // there's nothing new to align, the user has live processes (usermod can't
+    // renumber it anyway), and re-running it every connect is what made devcon
+    // appear to hang. No-op when disabled/non-Linux/root/already-aligned.
+    if created {
+        align_user_uid(dc, &container);
+    }
 
     // postCreate: once per creation. A hook failure is warned, NOT fatal — a
     // broken postCreate must not lock you out of an otherwise-healthy container.
@@ -662,7 +668,10 @@ fi
 if [ "$cur_uid" != "$hu" ]; then
   if getent passwd "$hu" >/dev/null 2>&1; then usermod -o -u "$hu" "$u"; else usermod -u "$hu" "$u"; fi
 fi
-if [ -n "$home" ]; then chown -R "$hu:$hg" "$home" 2>/dev/null || true; fi
+# Re-own the image's home, but stay on the home filesystem (-xdev) so we don't
+# recurse into mounted volumes (e.g. a big, shared ~/.claude) — that turned an
+# instant remap into a multi-minute chown.
+if [ -n "$home" ]; then find "$home" -xdev -exec chown -h "$hu:$hg" {} + 2>/dev/null || true; fi
 exit 0
 "#;
 
@@ -685,7 +694,7 @@ fn align_user_uid(dc: &Devcontainer, container: &Container) {
     let Some((host_uid, host_gid)) = host_ids() else {
         return;
     };
-    if let Err(e) = docker::exec_root_capture(
+    let outcome = docker::exec_root_timed(
         container,
         &[
             "sh",
@@ -696,11 +705,18 @@ fn align_user_uid(dc: &Devcontainer, container: &Container) {
             &host_uid,
             &host_gid,
         ],
-    ) {
-        eprintln!(
+        std::time::Duration::from_secs(30),
+    );
+    match outcome {
+        docker::RootExec::Ok | docker::RootExec::Spawn => {}
+        docker::RootExec::Failed(err) => eprintln!(
             "\x1b[33mdevcon:\x1b[0m couldn't align user '{user}' to host uid {host_uid}:{host_gid} \
-             — bind-mounted files may not be writable ({e})"
-        );
+             — bind-mounted files may not be writable ({err})"
+        ),
+        docker::RootExec::TimedOut => eprintln!(
+            "\x1b[33mdevcon:\x1b[0m user-uid alignment timed out and was skipped — \
+             connecting anyway"
+        ),
     }
 }
 

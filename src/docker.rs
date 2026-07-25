@@ -4,8 +4,10 @@
 //! query.
 
 use crate::devcontainer::Devcontainer;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// The label `devcon` stamps on containers *it creates* (image-based) at
 /// `docker run` time — a "created by devcon" identity marker surfaced by
@@ -347,13 +349,60 @@ pub fn container_config_user(container: &Container) -> Option<String> {
     }
 }
 
-/// `docker exec -u 0 <container> <argv…>` capturing stdout — run a command as
-/// root inside the container. Used for the uid/gid alignment bootstrap. Errors
-/// (carrying stderr) on non-zero exit.
-pub fn exec_root_capture(container: &Container, argv: &[&str]) -> Result<Vec<u8>, Error> {
-    let mut args: Vec<&str> = vec!["exec", "-u", "0", &container.id];
-    args.extend_from_slice(argv);
-    run_docker(&args)
+/// Result of a timeout-bounded root exec.
+pub enum RootExec {
+    /// Ran and exited 0.
+    Ok,
+    /// Ran and exited non-zero; carries trimmed stderr.
+    Failed(String),
+    /// Exceeded the timeout and was killed.
+    TimedOut,
+    /// Couldn't even spawn docker.
+    Spawn,
+}
+
+/// Run `<argv…>` as root inside the container with a wall-clock timeout, so a
+/// slow step (e.g. a large `chown`) can never hang the caller. Used for the
+/// uid/gid alignment bootstrap. stdout is discarded; stderr is captured for
+/// diagnostics (kept small by design). Never blocks past `timeout`.
+pub fn exec_root_timed(container: &Container, argv: &[&str], timeout: Duration) -> RootExec {
+    let mut cmd = Command::new("docker");
+    cmd.args(["exec", "-u", "0", &container.id]);
+    cmd.args(argv);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return RootExec::Spawn,
+    };
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut err = String::new();
+                if let Some(mut s) = child.stderr.take() {
+                    let _ = s.read_to_string(&mut err);
+                }
+                return if status.success() {
+                    RootExec::Ok
+                } else {
+                    RootExec::Failed(err.trim().to_string())
+                };
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return RootExec::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return RootExec::Spawn,
+        }
+    }
 }
 
 /// Force-remove a container (`docker rm -f`). Used when rebuilding an
