@@ -516,7 +516,9 @@ fn bring_up_image(dc: &Devcontainer) -> Result<(), Error> {
         "-w".into(),
         workspace,
     ];
-    // Stamp the run-once marker label at creation for containers we own.
+    // Stamp the "created by devcon" identity label (surfaced by `devcon ls`).
+    // This is NOT the postCreate-done signal — that's the in-container sentinel
+    // written only after postCreate runs (see docker::has_marker).
     args.push("--label".into());
     args.push(format!("{}=1", docker::MARKER_LABEL));
     // Run PID 1 as the declared user only when we're NOT about to remap that
@@ -617,19 +619,12 @@ fn run_commands(
     Ok(())
 }
 
-/// Record that postCreate ran by adding a label to the container. Docker can't
-/// relabel a running container in-place, so we use `docker container update`'s
-/// unavailability gracefully: we write a sentinel *inside* the container as the
-/// portable mechanism, and additionally try a filesystem marker the inspect
-/// reads. Simpler + reliable: drop a marker file the next `has_marker` checks.
-///
-/// NOTE: Docker has no supported "add label to running container" command, so
-/// the label is set at `docker run`/`compose` creation for image-based
-/// containers we own. For containers we did *not* create (already-running
-/// compose services), we fall back to an in-container sentinel file.
+/// Record that postCreate ran by writing the sentinel *inside* the container.
+/// Docker has no supported "add a label to a running container" command, so a
+/// post-hoc label isn't an option — the in-container file is the portable
+/// mechanism, and it's what [`docker::has_marker`] checks. Works identically for
+/// image-based and compose containers.
 fn stamp_marker(container: &Container) -> Result<(), Error> {
-    // In-container sentinel (works regardless of who created the container —
-    // image-based ones we created also carry MARKER_LABEL, set at `docker run`).
     let touch = format!("touch {MARKER_SENTINEL} 2>/dev/null || true");
     let _ = docker::exec_command(container, None, None, &["sh", "-c", &touch]);
     Ok(())

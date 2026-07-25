@@ -8,7 +8,9 @@ use std::path::Path;
 use std::process::Command;
 
 /// The label `devcon` stamps on containers *it creates* (image-based) at
-/// `docker run` time, recording that postCreate ran. Read via `docker inspect`.
+/// `docker run` time — a "created by devcon" identity marker surfaced by
+/// `devcon ls`. It is NOT the postCreate-done signal (that's [`MARKER_SENTINEL`],
+/// stamped only after postCreate actually runs); see [`has_marker`].
 pub const MARKER_LABEL: &str = "dev.devcon.postcreate";
 
 /// Portable run-once sentinel written *inside* the container. Works even for
@@ -253,21 +255,17 @@ pub fn workspace_mount_destination(container: &Container, project_root: &Path) -
     workspaces_fallback
 }
 
-/// True if postCreate has already run for this container. Checks two signals:
-///   1. the [`MARKER_LABEL`] on containers `devcon` created (image-based), and
-///   2. the in-container [`MARKER_SENTINEL`] file (portable, incl. compose).
+/// True if postCreate has already run for this container, tracked solely by the
+/// in-container [`MARKER_SENTINEL`] file. This works for both image and compose
+/// containers and survives restarts (the sentinel lives on the container's
+/// writable layer, not a tmpfs), while a rebuild/recreate starts fresh.
+///
+/// NOTE: we deliberately do NOT key off [`MARKER_LABEL`] here. devcon stamps
+/// that label at `docker run` *creation* time — before postCreate could
+/// possibly have run — purely as a "created by devcon" identity marker for
+/// `devcon ls`. Treating its mere presence as "postCreate done" skipped
+/// postCreate entirely on the first connect for every image-based container.
 pub fn has_marker(container: &Container) -> bool {
-    // 1. Label check (cheap, no exec).
-    let tmpl = format!("{{{{index .Config.Labels \"{MARKER_LABEL}\"}}}}");
-    if let Ok(out) = run_docker(&["inspect", "-f", &tmpl, &container.id]) {
-        let v = String::from_utf8_lossy(&out);
-        let v = v.trim();
-        if !v.is_empty() && v != "<no value>" {
-            return true;
-        }
-    }
-
-    // 2. Sentinel file check.
     let status = Command::new("docker")
         .args(["exec", &container.id, "test", "-f", MARKER_SENTINEL])
         .status();
