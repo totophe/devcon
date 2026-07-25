@@ -108,11 +108,34 @@ fn maybe_rebuild(
     assume_yes: bool,
     rebuild: Rebuild,
 ) -> Result<Option<Container>, Error> {
+    if rebuild == Rebuild::Never {
+        return Ok(None);
+    }
+
+    // What kind of stack is the *running* container, vs. what the config now
+    // declares? A mismatch (image ⇄ compose) means the devcontainer switched
+    // stack type — connecting to the old container would land us in the wrong
+    // stack entirely, so this always counts as needing a rebuild.
+    let existing_compose = docker::is_compose_container(container);
+    let type_changed = existing_compose != dc.is_compose();
+
     let do_rebuild = match rebuild {
-        Rebuild::Never => false,
+        Rebuild::Never => unreachable!("handled above"),
         Rebuild::Force => true,
         Rebuild::Auto => {
-            let changed = drifted_files(dc, container);
+            let mut changed = drifted_files(dc, container);
+            if type_changed {
+                // Surface the switch first — it's the decisive reason, and a
+                // stronger signal than any file mtime.
+                changed.insert(
+                    0,
+                    format!(
+                        "its stack type ({} → {})",
+                        kind_word(existing_compose),
+                        kind_word(dc.is_compose()),
+                    ),
+                );
+            }
             if changed.is_empty() {
                 false
             } else if !assume_yes && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
@@ -134,11 +157,20 @@ fn maybe_rebuild(
         return Ok(None);
     }
 
-    rebuild_stack(dc, container)?;
+    rebuild_stack(dc, container, existing_compose)?;
     let fresh = docker::find(dc)
         .map_err(Error::Docker)?
         .ok_or(Error::NotUpAfterStart)?;
     Ok(Some(fresh))
+}
+
+/// `"compose"` / `"container"` — for drift/rebuild messages.
+fn kind_word(is_compose: bool) -> &'static str {
+    if is_compose {
+        "compose"
+    } else {
+        "container"
+    }
 }
 
 /// The stack files whose mtime is newer than the container's creation time.
@@ -196,17 +228,59 @@ fn confirm_rebuild(changed: &[String]) -> Result<bool, Error> {
     Ok(answer == "y" || answer == "yes")
 }
 
-/// Recreate the container so stack changes take effect. Compose stacks rebuild
-/// their image and force-recreate in place; image-based stacks are removed and
-/// re-run. Either way the fresh container has no run-once markers, so
+/// Recreate the container so stack changes take effect.
+///
+/// The old stack is torn down according to what the running container *actually*
+/// is (`existing_compose`), which may differ from what the config now declares
+/// when the project switched stack type. This is what stops an image↔compose
+/// switch from leaving an orphaned old container that a later `find()` would
+/// reattach to. An old image container is always `docker rm -f`'d (even when the
+/// new stack is compose — otherwise the `docker run` container survives
+/// untouched); an old compose stack is brought fully down by its project label
+/// (the new image-based config no longer carries the compose files). A same-kind
+/// rebuild takes the fast path: compose force-recreates in place, image re-runs
+/// after removal.
+///
+/// Either way the fresh container has no run-once markers, so
 /// `postCreateCommand`/`postStartCommand` re-run naturally afterward.
-fn rebuild_stack(dc: &Devcontainer, container: &Container) -> Result<(), Error> {
+fn rebuild_stack(
+    dc: &Devcontainer,
+    container: &Container,
+    existing_compose: bool,
+) -> Result<(), Error> {
     eprintln!("\x1b[36mdevcon:\x1b[0m rebuilding…");
-    if dc.is_compose() {
+    let target_compose = dc.is_compose();
+
+    // Tear down the OLD stack by its real kind.
+    if existing_compose && !target_compose {
+        // compose → image: remove the whole old stack, not just the dev service.
+        tear_down_old_compose(container)?;
+    } else if !existing_compose {
+        // Old is a standalone image container (target image or compose): remove
+        // it so nothing can reattach to it. For a same-kind compose rebuild we
+        // skip this and let `--force-recreate` handle it in place.
+        docker::remove(container).map_err(Error::Docker)?;
+    }
+
+    // Bring up the NEW stack.
+    if target_compose {
         rebuild_compose(dc)
     } else {
-        docker::remove(container).map_err(Error::Docker)?;
         bring_up_image(dc)
+    }
+}
+
+/// Bring the old compose stack down by its project label. Used only on a
+/// compose → image switch, where the current (image-based) config no longer
+/// knows the compose files. Falls back to removing just the discovered
+/// container if the label is somehow absent.
+fn tear_down_old_compose(container: &Container) -> Result<(), Error> {
+    match docker::compose_project(container) {
+        Some(project) => {
+            eprintln!("\x1b[36mdevcon:\x1b[0m removing old compose stack '{project}'…");
+            docker::compose_down_project(&project).map_err(Error::Docker)
+        }
+        None => docker::remove(container).map_err(Error::Docker),
     }
 }
 

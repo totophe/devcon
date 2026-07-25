@@ -77,10 +77,14 @@ pub fn find(dc: &Devcontainer) -> Result<Option<Container>, Error> {
         })
         .collect();
 
-    // Pass 1: exact devcontainer.local_folder label match.
+    // Pass 1: exact devcontainer.local_folder label match — but only accept a
+    // container whose stack *kind* matches the config. Otherwise an orphaned
+    // old-stack container (e.g. a leftover image container after the project
+    // switched to compose — both carry the same local_folder) would shadow the
+    // real one, and we'd reattach to the wrong stack.
     if let Some(r) = rows
         .iter()
-        .find(|r| r.local_folder == project_root_str.as_ref())
+        .find(|r| r.local_folder == project_root_str.as_ref() && row_stack_matches(dc, r))
     {
         return Ok(Some(r.into()));
     }
@@ -139,6 +143,15 @@ impl From<&PsRow> for Container {
 
 fn name_matches_project(name: &str, project_folder: &str) -> bool {
     !project_folder.is_empty() && name.contains(project_folder)
+}
+
+/// True if a `docker ps` row's stack kind matches the config's. A container in
+/// a compose stack carries `com.docker.compose.service`; a standalone image
+/// container doesn't. Used to reject a same-path container of the wrong kind
+/// (the image↔compose switch case).
+fn row_stack_matches(dc: &Devcontainer, row: &PsRow) -> bool {
+    let row_is_compose = !row.compose_service.is_empty();
+    row_is_compose == dc.is_compose()
 }
 
 /// True if the container bind-mounts the project root (i.e. it's the dev
@@ -300,11 +313,43 @@ pub fn created_at(container: &Container) -> Option<String> {
     }
 }
 
+/// The container's compose project (`com.docker.compose.project` label), if it
+/// belongs to one. Present → the container is part of a compose stack; absent →
+/// it's a standalone image container (e.g. one `devcon` created with
+/// `docker run`). Lets us tell what kind of stack the *running* container is,
+/// independent of what the current config declares — the signal for detecting
+/// an image↔compose switch on rebuild.
+pub fn compose_project(container: &Container) -> Option<String> {
+    let tmpl = "{{index .Config.Labels \"com.docker.compose.project\"}}";
+    let out = run_docker(&["inspect", "-f", tmpl, &container.id]).ok()?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() || s == "<no value>" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// True if the container is part of a compose stack (has a compose project
+/// label). The inverse is a standalone image container.
+pub fn is_compose_container(container: &Container) -> bool {
+    compose_project(container).is_some()
+}
+
 /// Force-remove a container (`docker rm -f`). Used when rebuilding an
 /// image-based stack, where recreation means tearing down the old container
 /// before `docker run` makes a fresh one, and by `devcon down`.
 pub fn remove(container: &Container) -> Result<(), Error> {
     run_docker(&["rm", "-f", &container.id]).map(|_| ())
+}
+
+/// Tear down an entire compose stack by project name (`docker compose -p NAME
+/// down`). Used when a project switches *away* from compose (compose → image):
+/// the new config no longer carries the compose files, so we remove the old
+/// stack by the project label Docker recorded on it. Compose resolves the
+/// stack's containers + network from that label, no compose file needed.
+pub fn compose_down_project(project: &str) -> Result<(), Error> {
+    run_docker(&["compose", "-p", project, "down"]).map(|_| ())
 }
 
 /// Stop a container without removing it (`docker stop`). Used by
@@ -391,6 +436,10 @@ pub struct Project {
     pub key: String,
     /// A friendly display name (the path's basename, or the compose project).
     pub name: String,
+    /// Host directory the project lives in: `devcontainer.local_folder` for
+    /// image/VS Code containers, or the compose `working_dir` for a stack.
+    /// Empty when neither label is present (older Docker, or an odd launch).
+    pub path: String,
     /// Kind of stack, for display: `"compose"` or `"container"`.
     pub kind: &'static str,
     /// True if at least one of the project's containers is running.
@@ -408,6 +457,9 @@ struct ProjectRow {
     compose_project: String,
     state: String,
     devcon_marker: bool,
+    /// `com.docker.compose.project.working_dir` — where a compose stack was
+    /// launched from. Empty for non-compose containers.
+    working_dir: String,
 }
 
 /// List dev-container projects present on this host (running or stopped).
@@ -422,7 +474,7 @@ pub fn list_projects(all: bool) -> Result<Vec<Project>, Error> {
         "ps",
         "-a",
         "--format",
-        "{{.Label \"devcontainer.local_folder\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.State}}\t{{.Label \"dev.devcon.postcreate\"}}",
+        "{{.Label \"devcontainer.local_folder\"}}\t{{.Label \"com.docker.compose.project\"}}\t{{.State}}\t{{.Label \"dev.devcon.postcreate\"}}\t{{.Label \"com.docker.compose.project.working_dir\"}}",
     ])?;
     let stdout = String::from_utf8_lossy(&output);
     let rows = stdout.lines().filter_map(parse_project_row);
@@ -431,16 +483,22 @@ pub fn list_projects(all: bool) -> Result<Vec<Project>, Error> {
 
 /// Parse one tab-separated project-listing row. Returns `None` for blank lines.
 fn parse_project_row(line: &str) -> Option<ProjectRow> {
-    let c: Vec<&str> = line.splitn(4, '\t').collect();
+    let c: Vec<&str> = line.splitn(5, '\t').collect();
     if c.iter().all(|f| f.trim().is_empty()) {
         return None;
     }
     let marker = c.get(3).map(|s| s.trim()).unwrap_or("");
+    let working_dir = c.get(4).map(|s| s.trim()).unwrap_or("");
     Some(ProjectRow {
         local_folder: c.first().map(|s| s.trim().to_string()).unwrap_or_default(),
         compose_project: c.get(1).map(|s| s.trim().to_string()).unwrap_or_default(),
         state: c.get(2).map(|s| s.trim().to_string()).unwrap_or_default(),
         devcon_marker: !marker.is_empty() && marker != "<no value>",
+        working_dir: if working_dir == "<no value>" {
+            String::new()
+        } else {
+            working_dir.to_string()
+        },
     })
 }
 
@@ -488,11 +546,19 @@ fn group_projects(rows: impl Iterator<Item = ProjectRow>, all: bool) -> Vec<Proj
             r.compose_project.clone()
         };
         let kind = if is_compose { "compose" } else { "container" };
+        // Where the project lives: the dev container's own host path when it
+        // carries one, else the compose stack's launch directory.
+        let path = if has_devcontainer {
+            r.local_folder.clone()
+        } else {
+            r.working_dir.clone()
+        };
 
         let running = r.state.eq_ignore_ascii_case("running");
         let entry = map.entry(key.clone()).or_insert_with(|| Project {
             key,
             name: name.clone(),
+            path: path.clone(),
             kind,
             running: false,
             container_count: 0,
@@ -505,6 +571,13 @@ fn group_projects(rows: impl Iterator<Item = ProjectRow>, all: bool) -> Vec<Proj
         // any member reveals one (the dev-container member carries the path).
         if has_devcontainer {
             entry.name = name;
+        }
+        // The dev-container member's local_folder is the authoritative path;
+        // otherwise fill from a compose working_dir if we didn't have one yet.
+        if has_devcontainer {
+            entry.path = path;
+        } else if entry.path.is_empty() && !r.working_dir.is_empty() {
+            entry.path = r.working_dir.clone();
         }
         // A devcontainer label or devcon marker on *any* member makes the whole
         // group a dev project.
@@ -575,7 +648,58 @@ impl std::fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_projects, scan_workspace_service, ProjectRow};
+    use super::{group_projects, row_stack_matches, scan_workspace_service, ProjectRow, PsRow};
+    use crate::devcontainer::Devcontainer;
+    use std::path::PathBuf;
+
+    /// Minimal Devcontainer for stack-kind checks: compose iff `compose` is set.
+    fn dc(compose: bool) -> Devcontainer {
+        Devcontainer {
+            project_root: PathBuf::from("/home/u/proj"),
+            config_file: PathBuf::from("/home/u/proj/.devcontainer/devcontainer.json"),
+            dockerfile: None,
+            image: if compose {
+                None
+            } else {
+                Some("img:latest".into())
+            },
+            compose_files: if compose {
+                vec!["compose.yml".into()]
+            } else {
+                vec![]
+            },
+            service: None,
+            run_services: vec![],
+            workspace_folder: None,
+            remote_user: None,
+            post_create: vec![],
+            post_start: vec![],
+            name: None,
+        }
+    }
+
+    fn ps_row(compose_service: &str) -> PsRow {
+        PsRow {
+            id: "abc".into(),
+            name: "container".into(),
+            local_folder: "/home/u/proj".into(),
+            compose_service: compose_service.into(),
+        }
+    }
+
+    #[test]
+    fn row_stack_matches_rejects_wrong_kind() {
+        let image_row = ps_row(""); // no compose service → standalone image
+        let compose_row = ps_row("workbench"); // compose member
+
+        // A compose config must not match a leftover image container sharing the
+        // same local_folder (the image→compose switch reattach bug), and vice
+        // versa. Same-kind rows still match.
+        assert!(!row_stack_matches(&dc(true), &image_row));
+        assert!(row_stack_matches(&dc(true), &compose_row));
+        assert!(row_stack_matches(&dc(false), &image_row));
+        assert!(!row_stack_matches(&dc(false), &compose_row));
+    }
 
     fn row(local_folder: &str, compose: &str, state: &str, marker: bool) -> ProjectRow {
         ProjectRow {
@@ -583,6 +707,19 @@ mod tests {
             compose_project: compose.into(),
             state: state.into(),
             devcon_marker: marker,
+            working_dir: String::new(),
+        }
+    }
+
+    /// A compose sidecar row carrying only the stack's `working_dir` (no
+    /// devcontainer label — the shape `deploy`-style stacks show up as).
+    fn compose_row(compose: &str, state: &str, working_dir: &str) -> ProjectRow {
+        ProjectRow {
+            local_folder: String::new(),
+            compose_project: compose.into(),
+            state: state.into(),
+            devcon_marker: false,
+            working_dir: working_dir.into(),
         }
     }
 
@@ -625,6 +762,38 @@ mod tests {
             true,
         );
         assert_eq!(shown.len(), 1);
+    }
+
+    #[test]
+    fn compose_stack_path_comes_from_working_dir() {
+        // A plain compose stack (like `deploy`): no devcontainer label, but its
+        // working_dir tells us where it lives. Shown with --all.
+        let projects = group_projects(
+            vec![
+                compose_row("deploy", "running", "/srv/deploy"),
+                compose_row("deploy", "running", "/srv/deploy"),
+            ]
+            .into_iter(),
+            true,
+        );
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "deploy");
+        assert_eq!(projects[0].path, "/srv/deploy");
+    }
+
+    #[test]
+    fn devcontainer_path_wins_over_compose_working_dir() {
+        // The dev-container member's local_folder is authoritative even when a
+        // sidecar reports a different working_dir.
+        let projects = group_projects(
+            vec![
+                compose_row("proj", "running", "/tmp/build"),
+                row("/home/u/proj", "proj", "running", false),
+            ]
+            .into_iter(),
+            false,
+        );
+        assert_eq!(projects[0].path, "/home/u/proj");
     }
 
     #[test]

@@ -163,11 +163,25 @@ fn list_projects(all: bool) {
         return;
     }
 
-    // Column-align on the project name.
-    let name_w = projects.iter().map(|p| p.name.len()).max().unwrap_or(0);
+    // Column-align on the project name (leave room for the header, too).
+    let name_w = projects
+        .iter()
+        .map(|p| p.name.len())
+        .chain(std::iter::once("PROJECT".len()))
+        .max()
+        .unwrap_or(0);
+
+    // Header row (bold), matching the data layout: STATUS(7) PROJECT KIND(9) PATH.
+    println!(
+        "\x1b[1m{status:<7}  {name:<name_w$}  {kind:<9}  PATH\x1b[0m",
+        status = "STATUS",
+        name = "PROJECT",
+        kind = "KIND",
+    );
+
     for p in &projects {
         let status = if p.running {
-            "\x1b[32mup\x1b[0m     " // green
+            "\x1b[32mup\x1b[0m     " // green, padded to "stopped"'s width
         } else {
             "\x1b[90mstopped\x1b[0m"
         };
@@ -177,8 +191,14 @@ fn list_projects(all: bool) {
         } else {
             String::new()
         };
+        // Unknown path (no location label) shows a dim dash rather than a blank.
+        let path = if p.path.is_empty() {
+            "\x1b[90m—\x1b[0m".to_string()
+        } else {
+            p.path.clone()
+        };
         println!(
-            "{status}  {name:<name_w$}  {kind:<9}{managed}{count}",
+            "{status}  {name:<name_w$}  {kind:<9}  {path}{managed}{count}",
             name = p.name,
             kind = p.kind,
         );
