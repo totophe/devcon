@@ -61,6 +61,11 @@ pub fn ensure_up(
         }
     };
 
+    // Align the container user's uid/gid to the host user's BEFORE postCreate,
+    // so hooks (and you) write into a correctly-owned home and workspace. No-op
+    // when disabled/non-Linux/root/already-aligned; non-fatal on error.
+    align_user_uid(dc, &container);
+
     // postCreate: once per creation. A hook failure is warned, NOT fatal — a
     // broken postCreate must not lock you out of an otherwise-healthy container.
     // The marker is only stamped on success (inside run_post_create), so it
@@ -514,9 +519,15 @@ fn bring_up_image(dc: &Devcontainer) -> Result<(), Error> {
     // Stamp the run-once marker label at creation for containers we own.
     args.push("--label".into());
     args.push(format!("{}=1", docker::MARKER_LABEL));
+    // Run PID 1 as the declared user only when we're NOT about to remap that
+    // user's uid to the host's — usermod can't renumber a user that already has
+    // a live process. When remapping, PID 1 stays root and the shell/hooks exec
+    // as the user afterward (matching VS Code's overrideCommand-as-root model).
     if let Some(user) = &dc.remote_user {
-        args.push("-u".into());
-        args.push(user.clone());
+        if !will_remap_to_host(dc) {
+            args.push("-u".into());
+            args.push(user.clone());
+        }
     }
     args.push(image.to_string());
     // Keep the container alive; the shell comes later via `docker exec`.
@@ -628,6 +639,120 @@ fn describe(cmd: &PostCreateCommand) -> String {
     match cmd {
         PostCreateCommand::Shell(s) => s.clone(),
         PostCreateCommand::Argv(v) => v.join(" "),
+    }
+}
+
+/// Whether devcon is running on a Linux host — the only place a host uid is
+/// meaningful to match (on macOS/Windows the Docker VM handles translation, so
+/// VS Code no-ops the remap there too).
+#[cfg(target_os = "linux")]
+const HOST_IS_LINUX: bool = true;
+#[cfg(not(target_os = "linux"))]
+const HOST_IS_LINUX: bool = false;
+
+/// Root bootstrap that renumbers a container user to the host user's uid/gid and
+/// re-owns its home, so bind-mounted files become writable. Idempotent — exits
+/// early when already aligned. Args: `$1`=user `$2`=host_uid `$3`=host_gid.
+/// Uses `-o` (non-unique) fallbacks when the target id is already taken, and
+/// tolerates a partial `chown`, mirroring VS Code's uid-update script.
+const UID_ALIGN_SCRIPT: &str = r#"set -e
+u="$1"; hu="$2"; hg="$3"
+cur_uid=$(id -u "$u"); cur_gid=$(id -g "$u")
+if [ "$cur_uid" = "$hu" ] && [ "$cur_gid" = "$hg" ]; then exit 0; fi
+grp=$(id -gn "$u")
+home=$(getent passwd "$u" | cut -d: -f6)
+if [ "$cur_gid" != "$hg" ]; then
+  if getent group "$hg" >/dev/null 2>&1; then usermod -g "$hg" "$u"; else groupmod -g "$hg" "$grp"; fi
+fi
+if [ "$cur_uid" != "$hu" ]; then
+  if getent passwd "$hu" >/dev/null 2>&1; then usermod -o -u "$hu" "$u"; else usermod -u "$hu" "$u"; fi
+fi
+if [ -n "$home" ]; then chown -R "$hu:$hg" "$home" 2>/dev/null || true; fi
+exit 0
+"#;
+
+/// Remap the container user's uid/gid to the host user's (`updateRemoteUserUID`,
+/// spec default true). Runs as root before postCreate. No-op when opted out, on
+/// a non-Linux host, for a root target, or when already aligned (the script
+/// checks). Non-fatal: a failure warns and connects anyway — common on compose
+/// services whose main process already runs as that user (usermod can't
+/// renumber a live user), where the real fix is baking the right uid.
+fn align_user_uid(dc: &Devcontainer, container: &Container) {
+    if !dc.update_remote_user_uid || !HOST_IS_LINUX {
+        return;
+    }
+    let Some(user) = remap_target_user(dc, container) else {
+        return;
+    };
+    if is_root_user(&user) {
+        return;
+    }
+    let Some((host_uid, host_gid)) = host_ids() else {
+        return;
+    };
+    if let Err(e) = docker::exec_root_capture(
+        container,
+        &[
+            "sh",
+            "-c",
+            UID_ALIGN_SCRIPT,
+            "devcon-uid",
+            &user,
+            &host_uid,
+            &host_gid,
+        ],
+    ) {
+        eprintln!(
+            "\x1b[33mdevcon:\x1b[0m couldn't align user '{user}' to host uid {host_uid}:{host_gid} \
+             — bind-mounted files may not be writable ({e})"
+        );
+    }
+}
+
+/// The uid-remap target: `remoteUser`, else `containerUser`, else the image's
+/// baked user — matching how VS Code resolves it.
+fn remap_target_user(dc: &Devcontainer, container: &Container) -> Option<String> {
+    dc.remote_user
+        .clone()
+        .or_else(|| dc.container_user.clone())
+        .or_else(|| docker::container_config_user(container))
+}
+
+fn is_root_user(user: &str) -> bool {
+    user == "root" || user == "0"
+}
+
+/// Will we remap a `docker run` image container's user to the host's? If so it
+/// must start with PID 1 as **root** (usermod can't renumber a user with a live
+/// process), and the shell/hooks exec as the user afterward. When not remapping,
+/// callers keep the old behavior of running PID 1 as the declared user.
+fn will_remap_to_host(dc: &Devcontainer) -> bool {
+    dc.update_remote_user_uid
+        && HOST_IS_LINUX
+        && dc
+            .remote_user
+            .as_deref()
+            .or(dc.container_user.as_deref())
+            .map(|u| !is_root_user(u))
+            .unwrap_or(false)
+}
+
+/// The uid/gid of the user running devcon on the host, as strings for the align
+/// script. `None` if `id` can't be read.
+fn host_ids() -> Option<(String, String)> {
+    Some((run_id(&["-u"])?, run_id(&["-g"])?))
+}
+
+fn run_id(args: &[&str]) -> Option<String> {
+    let out = Command::new("id").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 

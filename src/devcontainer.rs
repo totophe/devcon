@@ -33,6 +33,13 @@ pub struct Devcontainer {
     pub workspace_folder: Option<String>,
     /// `remoteUser` — who a shell/exec should run as.
     pub remote_user: Option<String>,
+    /// `containerUser` — the user the container process itself runs as; the
+    /// fallback uid-remap target when `remoteUser` is unset.
+    pub container_user: Option<String>,
+    /// `updateRemoteUserUID` (spec default **true**): on create, remap the
+    /// container user's uid/gid to the host user's so bind-mounted files are
+    /// writable on hosts where the developer's uid isn't 1000.
+    pub update_remote_user_uid: bool,
     /// `postCreateCommand`, normalized to a shell-runnable list of commands.
     /// Runs once per container *creation*.
     pub post_create: Vec<LifecycleCommand>,
@@ -125,6 +132,8 @@ impl Devcontainer {
             run_services: parsed.run_services,
             workspace_folder: parsed.workspace_folder,
             remote_user: parsed.remote_user,
+            container_user: parsed.container_user,
+            update_remote_user_uid: parsed.update_remote_user_uid,
             post_create: parsed.post_create_command.into_commands(),
             post_start: parsed.post_start_command.into_commands(),
             name: parsed.name,
@@ -215,6 +224,10 @@ struct Raw {
     workspace_folder: Option<String>,
     #[serde(default, rename = "remoteUser")]
     remote_user: Option<String>,
+    #[serde(default, rename = "containerUser")]
+    container_user: Option<String>,
+    #[serde(default = "default_true", rename = "updateRemoteUserUID")]
+    update_remote_user_uid: bool,
     #[serde(default, rename = "postCreateCommand")]
     post_create_command: CommandField,
     #[serde(default, rename = "postStartCommand")]
@@ -225,6 +238,11 @@ struct Raw {
     /// Legacy top-level form: `"dockerFile": "Dockerfile"`.
     #[serde(default, rename = "dockerFile")]
     docker_file: Option<String>,
+}
+
+/// serde default for `updateRemoteUserUID`, which the spec defaults to `true`.
+fn default_true() -> bool {
+    true
 }
 
 /// The `build` object; we only need the Dockerfile path for drift detection.
@@ -569,6 +587,29 @@ mod tests {
         );
         let dc = Devcontainer::load(tmp.path()).unwrap();
         assert_eq!(dc.post_create.len(), 2);
+    }
+
+    #[test]
+    fn update_remote_user_uid_defaults_true_and_parses_container_user() {
+        let tmp = TempDir::new().unwrap();
+        write_dc(
+            tmp.path(),
+            r#"{ "image": "x", "remoteUser": "wm", "containerUser": "wm" }"#,
+        );
+        let dc = Devcontainer::load(tmp.path()).unwrap();
+        assert!(dc.update_remote_user_uid, "defaults to true when absent");
+        assert_eq!(dc.container_user.as_deref(), Some("wm"));
+    }
+
+    #[test]
+    fn update_remote_user_uid_opt_out() {
+        let tmp = TempDir::new().unwrap();
+        write_dc(
+            tmp.path(),
+            r#"{ "image": "x", "updateRemoteUserUID": false }"#,
+        );
+        let dc = Devcontainer::load(tmp.path()).unwrap();
+        assert!(!dc.update_remote_user_uid);
     }
 
     #[test]

@@ -336,6 +336,28 @@ pub fn is_compose_container(container: &Container) -> bool {
     compose_project(container).is_some()
 }
 
+/// The user the container's main process runs as (`Config.User`), or `None`
+/// when it's empty (root). The last-resort uid-remap target when neither
+/// `remoteUser` nor `containerUser` is declared in devcontainer.json.
+pub fn container_config_user(container: &Container) -> Option<String> {
+    let out = run_docker(&["inspect", "-f", "{{.Config.User}}", &container.id]).ok()?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() || s == "<no value>" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// `docker exec -u 0 <container> <argv…>` capturing stdout — run a command as
+/// root inside the container. Used for the uid/gid alignment bootstrap. Errors
+/// (carrying stderr) on non-zero exit.
+pub fn exec_root_capture(container: &Container, argv: &[&str]) -> Result<Vec<u8>, Error> {
+    let mut args: Vec<&str> = vec!["exec", "-u", "0", &container.id];
+    args.extend_from_slice(argv);
+    run_docker(&args)
+}
+
 /// Force-remove a container (`docker rm -f`). Used when rebuilding an
 /// image-based stack, where recreation means tearing down the old container
 /// before `docker run` makes a fresh one, and by `devcon down`.
@@ -758,6 +780,8 @@ mod tests {
             run_services: vec![],
             workspace_folder: None,
             remote_user: None,
+            container_user: None,
+            update_remote_user_uid: true,
             post_create: vec![],
             post_start: vec![],
             name: None,
