@@ -39,12 +39,13 @@ pub fn ensure_up(
     existing: Option<Container>,
     assume_yes: bool,
     rebuild: Rebuild,
+    pull: bool,
 ) -> Result<Option<Container>, Error> {
     let (container, created) = match existing {
         Some(c) => {
             // Container is up: recreate it if the stack drifted (or was forced).
             // A rebuild counts as a fresh creation for the steps below.
-            match maybe_rebuild(dc, &c, assume_yes, rebuild)? {
+            match maybe_rebuild(dc, &c, assume_yes, rebuild, pull)? {
                 Some(fresh) => (fresh, true),
                 None => (c, false),
             }
@@ -54,7 +55,7 @@ pub fn ensure_up(
             if !assume_yes && !confirm_start(dc)? {
                 return Ok(None);
             }
-            bring_up(dc)?;
+            bring_up(dc, pull)?;
             // Re-discover the container now that it's running.
             let c = docker::find(dc)
                 .map_err(Error::Docker)?
@@ -125,6 +126,7 @@ fn maybe_rebuild(
     container: &Container,
     assume_yes: bool,
     rebuild: Rebuild,
+    pull: bool,
 ) -> Result<Option<Container>, Error> {
     if rebuild == Rebuild::Never {
         return Ok(None);
@@ -175,7 +177,7 @@ fn maybe_rebuild(
         return Ok(None);
     }
 
-    rebuild_stack(dc, container, existing_compose)?;
+    rebuild_stack(dc, container, existing_compose, pull)?;
     let fresh = docker::find(dc)
         .map_err(Error::Docker)?
         .ok_or_else(|| Error::NotUpAfterStart(docker::diagnose_not_running(dc)))?;
@@ -265,6 +267,7 @@ fn rebuild_stack(
     dc: &Devcontainer,
     container: &Container,
     existing_compose: bool,
+    pull: bool,
 ) -> Result<(), Error> {
     eprintln!("\x1b[36mdevcon:\x1b[0m rebuilding…");
     let target_compose = dc.is_compose();
@@ -282,9 +285,9 @@ fn rebuild_stack(
 
     // Bring up the NEW stack.
     if target_compose {
-        rebuild_compose(dc)
+        rebuild_compose(dc, pull)
     } else {
-        bring_up_image(dc)
+        bring_up_image(dc, pull)
     }
 }
 
@@ -304,24 +307,11 @@ fn tear_down_old_compose(container: &Container) -> Result<(), Error> {
 
 /// `docker compose up -d --build --force-recreate` for the dev service(s).
 /// `--build` picks up Dockerfile edits; `--force-recreate` picks up compose /
-/// devcontainer.json edits even when the image is unchanged.
-fn rebuild_compose(dc: &Devcontainer) -> Result<(), Error> {
+/// devcontainer.json edits even when the image is unchanged. `pull` adds
+/// `--pull always` so newer registry images are fetched first.
+fn rebuild_compose(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
     let compose_dir = dc.project_root.join(".devcontainer");
-
-    let mut args: Vec<String> = vec!["compose".into()];
-    for f in &dc.compose_files {
-        args.push("-f".into());
-        args.push(f.clone());
-    }
-    args.push("up".into());
-    args.push("-d".into());
-    args.push("--build".into());
-    args.push("--force-recreate".into());
-    if !dc.run_services.is_empty() {
-        args.extend(dc.run_services.iter().cloned());
-    } else if let Some(svc) = &dc.service {
-        args.push(svc.clone());
-    }
+    let args = compose_up_args(dc, true, true, pull);
 
     let status = Command::new("docker")
         .args(&args)
@@ -457,20 +447,51 @@ fn bring_down_image(container: &Container, mode: TearDown) -> Result<(), Error> 
     }
 }
 
+/// The service list to append to `docker compose up -d`, per the devcontainer
+/// spec's `runServices` semantics:
+///
+///   * `runServices` set → bring up exactly those, but always include the
+///     primary `service` (it's what devcon execs into, so it must run) if the
+///     author left it out.
+///   * `runServices` empty → append nothing, so compose brings up *all*
+///     services. The spec says `runServices` "Defaults to all services"; a bare
+///     `up -d <service>` would start only the dev service plus its `depends_on`
+///     chain, silently omitting sibling services.
+///
+/// Mirrors the reference `@devcontainers/cli` behaviour.
+fn compose_up_services(dc: &Devcontainer) -> Vec<String> {
+    if dc.run_services.is_empty() {
+        return Vec::new();
+    }
+    let mut services = dc.run_services.clone();
+    if let Some(svc) = &dc.service {
+        if !services.iter().any(|s| s == svc) {
+            services.push(svc.clone());
+        }
+    }
+    services
+}
+
 /// Bring the container up: `docker compose up -d` for compose stacks, or
-/// `docker run` for image-based ones.
-fn bring_up(dc: &Devcontainer) -> Result<(), Error> {
+/// `docker run` for image-based ones. `pull` fetches newer images first.
+fn bring_up(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
     if dc.is_compose() {
-        bring_up_compose(dc)
+        bring_up_compose(dc, pull)
     } else {
-        bring_up_image(dc)
+        bring_up_image(dc, pull)
     }
 }
 
-fn bring_up_compose(dc: &Devcontainer) -> Result<(), Error> {
-    eprintln!("\x1b[36mdevcon:\x1b[0m starting compose stack…");
-    let compose_dir = dc.project_root.join(".devcontainer");
-
+/// The `docker compose … up -d …` argument vector, shared by the initial
+/// bring-up and the rebuild path. `build`/`force_recreate`/`pull` toggle the
+/// extra flags each caller needs. Service names (from [`compose_up_services`])
+/// go last, after every flag, as compose treats trailing args as positionals.
+fn compose_up_args(
+    dc: &Devcontainer,
+    build: bool,
+    force_recreate: bool,
+    pull: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["compose".into()];
     for f in &dc.compose_files {
         args.push("-f".into());
@@ -478,12 +499,24 @@ fn bring_up_compose(dc: &Devcontainer) -> Result<(), Error> {
     }
     args.push("up".into());
     args.push("-d".into());
-    // Only bring up the declared runServices (or the primary service) if named.
-    if !dc.run_services.is_empty() {
-        args.extend(dc.run_services.iter().cloned());
-    } else if let Some(svc) = &dc.service {
-        args.push(svc.clone());
+    if build {
+        args.push("--build".into());
     }
+    if force_recreate {
+        args.push("--force-recreate".into());
+    }
+    if pull {
+        args.push("--pull".into());
+        args.push("always".into());
+    }
+    args.extend(compose_up_services(dc));
+    args
+}
+
+fn bring_up_compose(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
+    eprintln!("\x1b[36mdevcon:\x1b[0m starting compose stack…");
+    let compose_dir = dc.project_root.join(".devcontainer");
+    let args = compose_up_args(dc, false, false, pull);
 
     let status = Command::new("docker")
         .args(&args)
@@ -497,10 +530,29 @@ fn bring_up_compose(dc: &Devcontainer) -> Result<(), Error> {
     Ok(())
 }
 
-fn bring_up_image(dc: &Devcontainer) -> Result<(), Error> {
+/// Pull the newest image for `image` before (re)creating the container
+/// (`--pull`). Non-fatal: a registry hiccup warns and falls back to the cached
+/// image rather than blocking the connect — a stale container beats no shell.
+fn pull_image(image: &str) {
+    eprintln!("\x1b[36mdevcon:\x1b[0m pulling {image}…");
+    let ok = Command::new("docker")
+        .args(["pull", image])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("\x1b[33mdevcon:\x1b[0m couldn't pull {image} — using the cached image.");
+    }
+}
+
+fn bring_up_image(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
     let image = dc.image.as_deref().ok_or_else(|| {
         Error::BringUpFailed("no image or dockerComposeFile in devcontainer.json".into())
     })?;
+
+    if pull {
+        pull_image(image);
+    }
 
     eprintln!("\x1b[36mdevcon:\x1b[0m starting container from {image}…");
 
@@ -652,28 +704,78 @@ const HOST_IS_LINUX: bool = true;
 const HOST_IS_LINUX: bool = false;
 
 /// Root bootstrap that renumbers a container user to the host user's uid/gid and
-/// re-owns its home, so bind-mounted files become writable. Idempotent — exits
-/// early when already aligned. Args: `$1`=user `$2`=host_uid `$3`=host_gid.
-/// Uses `-o` (non-unique) fallbacks when the target id is already taken, and
-/// tolerates a partial `chown`, mirroring VS Code's uid-update script.
+/// re-owns its home, so bind-mounted files become writable. Idempotent and
+/// re-runnable. Args: `$1`=user `$2`=host_uid `$3`=host_gid. Uses `-o`
+/// (non-unique) fallbacks when the target id is already taken, and tolerates a
+/// partial `chown`, mirroring VS Code's uid-update script.
+///
+/// The subtle part: `usermod -u`/`usermod -g` AUTOMATICALLY re-own the entire
+/// tree rooted at the account's home dir (see `man usermod`), stat-walking every
+/// file to find ones owned by the old id. On a large home that walk turned an
+/// instant remap into a multi-minute stall. So we point the account's home at a
+/// nonexistent path across the renumber (usermod then has nothing to walk) and
+/// re-own the home filesystem ourselves.
+///
+/// Ordering is load-bearing: we restore the real home *before* our own `chown`,
+/// not after. That `chown` is the slow step, and devcon SIGKILLs the exec if it
+/// blows the timeout — SIGKILL can't fire an EXIT trap, so restoring home only
+/// in a trap (or only after the chown) would strand the account at `/nonexistent`
+/// on a timeout, breaking every `$HOME`-relative postCreate step. With home
+/// restored first, a killed chown is harmless: it just resumes next run. As a
+/// belt-and-braces repair, a home already found at the sentinel (stranded by an
+/// older build) is reset to the conventional `/home/<user>` up front.
 const UID_ALIGN_SCRIPT: &str = r#"set -e
 u="$1"; hu="$2"; hg="$3"
-cur_uid=$(id -u "$u"); cur_gid=$(id -g "$u")
-if [ "$cur_uid" = "$hu" ] && [ "$cur_gid" = "$hg" ]; then exit 0; fi
 grp=$(id -gn "$u")
+cur_uid=$(id -u "$u"); cur_gid=$(id -g "$u")
 home=$(getent passwd "$u" | cut -d: -f6)
-if [ "$cur_gid" != "$hg" ]; then
-  if getent group "$hg" >/dev/null 2>&1; then usermod -g "$hg" "$u"; else groupmod -g "$hg" "$grp"; fi
+# Self-heal a home stranded at the sentinel by an interrupted earlier run.
+if [ "$home" = "/nonexistent" ]; then home="/home/$u"; usermod -d "$home" "$u" 2>/dev/null || true; fi
+# Renumber only if needed, home pointed away so usermod does no home-tree walk,
+# and restore home immediately after — BEFORE the slow chown below.
+if [ "$cur_uid" != "$hu" ] || [ "$cur_gid" != "$hg" ]; then
+  trap 'usermod -d "$home" "$u" 2>/dev/null || true' EXIT
+  usermod -d /nonexistent "$u"
+  if [ "$cur_gid" != "$hg" ]; then
+    if getent group "$hg" >/dev/null 2>&1; then usermod -g "$hg" "$u"; else groupmod -g "$hg" "$grp"; fi
+  fi
+  if [ "$cur_uid" != "$hu" ]; then
+    if getent passwd "$hu" >/dev/null 2>&1; then usermod -o -u "$hu" "$u"; else usermod -u "$hu" "$u"; fi
+  fi
+  usermod -d "$home" "$u"
+  trap - EXIT
 fi
-if [ "$cur_uid" != "$hu" ]; then
-  if getent passwd "$hu" >/dev/null 2>&1; then usermod -o -u "$hu" "$u"; else usermod -u "$hu" "$u"; fi
-fi
-# Re-own the image's home, but stay on the home filesystem (-xdev) so we don't
-# recurse into mounted volumes (e.g. a big, shared ~/.claude) — that turned an
-# instant remap into a multi-minute chown.
-if [ -n "$home" ]; then find "$home" -xdev -exec chown -h "$hu:$hg" {} + 2>/dev/null || true; fi
+# Re-own the home tree, staying on the home filesystem (-xdev) so we never
+# recurse into a mounted volume. Idempotent and safe to interrupt now that home
+# is already restored — a killed chown just resumes on the next run.
+if [ -d "$home" ]; then find "$home" -xdev -exec chown -h "$hu:$hg" {} + 2>/dev/null || true; fi
 exit 0
 "#;
+
+/// Default per-attempt wall-clock budget for the uid-alignment exec. Overridable
+/// via `DEVCON_UID_ALIGN_TIMEOUT` (whole seconds) for the rare large-home case.
+/// Set generously: now that `usermod`'s unbounded home-tree walk is avoided, the
+/// only slow step is our own `chown`, which SHOULD complete (an incomplete chown
+/// leaves part of `$HOME` owned by the old uid). 30s proved too tight for large
+/// baked homes (e.g. the wellmade dc-workbench image).
+const UID_ALIGN_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How many times to retry a *timed-out* alignment before giving up. Transient
+/// docker-daemon slowness on first connect is the usual cause, so one retry
+/// clears most of it. A `Failed` (non-zero) result is a real error — e.g. a live
+/// process the user owns that `usermod` can't renumber — and is never retried.
+const UID_ALIGN_ATTEMPTS: u32 = 2;
+
+/// Per-attempt timeout for uid alignment: [`UID_ALIGN_TIMEOUT_DEFAULT`] unless
+/// `DEVCON_UID_ALIGN_TIMEOUT` (whole seconds) overrides it.
+fn uid_align_timeout() -> std::time::Duration {
+    std::env::var("DEVCON_UID_ALIGN_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(UID_ALIGN_TIMEOUT_DEFAULT)
+}
 
 /// Remap the container user's uid/gid to the host user's (`updateRemoteUserUID`,
 /// spec default true). Runs as root before postCreate. No-op when opted out, on
@@ -694,30 +796,84 @@ fn align_user_uid(dc: &Devcontainer, container: &Container) {
     let Some((host_uid, host_gid)) = host_ids() else {
         return;
     };
-    let outcome = docker::exec_root_timed(
-        container,
-        &[
-            "sh",
-            "-c",
-            UID_ALIGN_SCRIPT,
-            "devcon-uid",
-            &user,
-            &host_uid,
-            &host_gid,
-        ],
-        std::time::Duration::from_secs(30),
-    );
-    match outcome {
-        docker::RootExec::Ok | docker::RootExec::Spawn => {}
-        docker::RootExec::Failed(err) => eprintln!(
-            "\x1b[33mdevcon:\x1b[0m couldn't align user '{user}' to host uid {host_uid}:{host_gid} \
-             — bind-mounted files may not be writable ({err})"
-        ),
-        docker::RootExec::TimedOut => eprintln!(
-            "\x1b[33mdevcon:\x1b[0m user-uid alignment timed out and was skipped — \
-             connecting anyway"
-        ),
+    // arg0 is a stable sentinel so a timed-out attempt can reap the orphaned
+    // in-container process (see below) without matching unrelated shells.
+    let argv = [
+        "sh",
+        "-c",
+        UID_ALIGN_SCRIPT,
+        UID_ALIGN_SENTINEL,
+        user.as_str(),
+        host_uid.as_str(),
+        host_gid.as_str(),
+    ];
+    let timeout = uid_align_timeout();
+    for attempt in 1..=UID_ALIGN_ATTEMPTS {
+        match docker::exec_root_timed(container, &argv, timeout) {
+            // Ok = aligned; Spawn = couldn't launch docker at all (a bigger
+            // problem surfaced elsewhere) — either way, stop quietly.
+            docker::RootExec::Ok | docker::RootExec::Spawn => return,
+            // A real error (e.g. usermod can't renumber a live user); retrying
+            // won't help, so warn once and connect anyway.
+            docker::RootExec::Failed(err) => {
+                eprintln!(
+                    "\x1b[33mdevcon:\x1b[0m couldn't align user '{user}' to host uid \
+                     {host_uid}:{host_gid} — bind-mounted files may not be writable ({err})"
+                );
+                return;
+            }
+            docker::RootExec::TimedOut => {
+                // Killing the exec only reaps the host-side client; the renumber
+                // may still be running inside the container, holding /etc/passwd
+                // locks. Best-effort-reap it before retrying or proceeding.
+                best_effort_kill(container, &[UID_ALIGN_SENTINEL, "usermod", "groupmod"]);
+                if attempt < UID_ALIGN_ATTEMPTS {
+                    eprintln!(
+                        "\x1b[33mdevcon:\x1b[0m user-uid alignment timed out \
+                         (attempt {attempt}/{UID_ALIGN_ATTEMPTS}) — retrying…"
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "\x1b[33mdevcon:\x1b[0m user-uid alignment timed out after \
+                     {UID_ALIGN_ATTEMPTS} attempts — connecting anyway. Files under the \
+                     container user's home may be owned by the wrong uid; if the home dir \
+                     is unwritable, run `devcon rebuild`, or raise the budget with \
+                     DEVCON_UID_ALIGN_TIMEOUT=<seconds>."
+                );
+                return;
+            }
+        }
     }
+}
+
+/// arg0 for the alignment script — a stable, unlikely-to-collide marker so a
+/// timed-out attempt can pkill exactly its own orphaned shell in the container.
+const UID_ALIGN_SENTINEL: &str = "devcon-uid";
+
+/// Best-effort reap of processes *inside* the container whose command line
+/// matches any of `patterns` (via `pkill -9 -f`). Needed because killing a
+/// timed-out `docker exec` only terminates the host-side client — the process it
+/// launched inside the container keeps running (e.g. a `usermod` still walking a
+/// large home, holding an `/etc/passwd` lock). Fully best-effort: the image may
+/// lack `pkill`, or there may be nothing to kill; output and exit status are
+/// ignored. Patterns must be specific enough not to catch unrelated processes —
+/// alignment runs before postCreate, so nothing else is renumbering users then.
+fn best_effort_kill(container: &Container, patterns: &[&str]) {
+    if patterns.is_empty() {
+        return;
+    }
+    let script = patterns
+        .iter()
+        .map(|p| format!("pkill -9 -f '{p}' 2>/dev/null"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let _ = Command::new("docker")
+        .args(["exec", "-u", "0", &container.id, "sh", "-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// The uid-remap target: `remoteUser`, else `containerUser`, else the image's
@@ -818,7 +974,144 @@ impl std::fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rfc3339_secs, post_start_sentinel};
+    use super::{compose_up_args, compose_up_services, parse_rfc3339_secs, post_start_sentinel};
+    use crate::devcontainer::Devcontainer;
+    use std::path::PathBuf;
+
+    /// A compose-based `Devcontainer` with the given `service` / `runServices`.
+    fn compose_dc(service: Option<&str>, run_services: &[&str]) -> Devcontainer {
+        Devcontainer {
+            project_root: PathBuf::from("/home/u/proj"),
+            config_file: PathBuf::from("/home/u/proj/.devcontainer/devcontainer.json"),
+            dockerfile: None,
+            image: None,
+            compose_files: vec!["compose.yml".into()],
+            service: service.map(str::to_string),
+            run_services: run_services.iter().map(|s| s.to_string()).collect(),
+            workspace_folder: None,
+            remote_user: None,
+            container_user: None,
+            update_remote_user_uid: true,
+            post_create: vec![],
+            post_start: vec![],
+            name: None,
+        }
+    }
+
+    #[test]
+    fn empty_run_services_brings_up_all() {
+        // Spec: runServices "Defaults to all services" — pass no filter so
+        // compose starts the whole stack, not just the dev service + its deps.
+        let dc = compose_dc(Some("app"), &[]);
+        assert!(compose_up_services(&dc).is_empty());
+    }
+
+    #[test]
+    fn run_services_always_includes_primary() {
+        // Author listed only sidecars; the dev service must still come up.
+        let dc = compose_dc(Some("app"), &["db", "redis"]);
+        assert_eq!(compose_up_services(&dc), vec!["db", "redis", "app"]);
+    }
+
+    #[test]
+    fn run_services_without_primary_is_not_duplicated() {
+        // Primary already present → don't append it twice.
+        let dc = compose_dc(Some("app"), &["app", "db"]);
+        assert_eq!(compose_up_services(&dc), vec!["app", "db"]);
+    }
+
+    #[test]
+    fn compose_up_args_initial_bring_up_is_minimal() {
+        // Plain bring-up: no --build/--force-recreate/--pull.
+        let dc = compose_dc(Some("app"), &[]);
+        assert_eq!(
+            compose_up_args(&dc, false, false, false),
+            vec!["compose", "-f", "compose.yml", "up", "-d"]
+        );
+    }
+
+    #[test]
+    fn compose_up_args_rebuild_with_pull_flags_precede_services() {
+        // Rebuild path with --pull: every flag comes before the service names,
+        // which compose parses as trailing positionals.
+        let dc = compose_dc(Some("app"), &["db"]);
+        assert_eq!(
+            compose_up_args(&dc, true, true, true),
+            vec![
+                "compose",
+                "-f",
+                "compose.yml",
+                "up",
+                "-d",
+                "--build",
+                "--force-recreate",
+                "--pull",
+                "always",
+                "db",
+                "app",
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_up_args_no_pull_omits_the_flag() {
+        let dc = compose_dc(Some("app"), &[]);
+        let args = compose_up_args(&dc, true, true, false);
+        assert!(!args.iter().any(|a| a == "--pull"));
+    }
+
+    #[test]
+    fn run_services_without_declared_service() {
+        // No `service` (unusual) → just the runServices, nothing invented.
+        let dc = compose_dc(None, &["db"]);
+        assert_eq!(compose_up_services(&dc), vec!["db"]);
+    }
+
+    #[test]
+    fn uid_align_script_avoids_usermods_home_walk() {
+        // Regression guard for the timeout root cause: the renumber must run with
+        // the account's home pointed at the sentinel (so usermod can't walk a
+        // mounted volume), with an EXIT trap to restore it, and the only explicit
+        // chown must stay on the home filesystem via -xdev.
+        let s = super::UID_ALIGN_SCRIPT;
+        assert!(s.contains("usermod -d /nonexistent"), "temp-home not set");
+        assert!(
+            s.contains(r#"trap 'usermod -d "$home" "$u""#),
+            "home not restored on exit"
+        );
+        assert!(s.contains("-xdev"), "explicit chown not bounded to home fs");
+        // The renumber must come *after* the temp-home juggle, never before.
+        let temp = s.find("usermod -d /nonexistent").unwrap();
+        let renumber = s.find("usermod -o -u").unwrap();
+        assert!(temp < renumber, "renumber runs before home is parked");
+    }
+
+    #[test]
+    fn uid_align_timeout_honors_env_override() {
+        // Serialized implicitly by cargo within one test binary; restore after.
+        let key = "DEVCON_UID_ALIGN_TIMEOUT";
+        let prev = std::env::var(key).ok();
+
+        std::env::set_var(key, "90");
+        assert_eq!(
+            super::uid_align_timeout(),
+            std::time::Duration::from_secs(90)
+        );
+
+        // Junk and zero fall back to the default, not a 0s (instant-timeout) budget.
+        std::env::set_var(key, "not-a-number");
+        assert_eq!(super::uid_align_timeout(), super::UID_ALIGN_TIMEOUT_DEFAULT);
+        std::env::set_var(key, "0");
+        assert_eq!(super::uid_align_timeout(), super::UID_ALIGN_TIMEOUT_DEFAULT);
+
+        std::env::remove_var(key);
+        assert_eq!(super::uid_align_timeout(), super::UID_ALIGN_TIMEOUT_DEFAULT);
+
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
 
     #[test]
     fn parses_docker_created_timestamp() {

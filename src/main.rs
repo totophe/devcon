@@ -49,6 +49,12 @@ struct Cli {
     #[arg(long = "no-rebuild")]
     no_rebuild: bool,
 
+    /// Pull the latest container image(s) before starting, then recreate so the
+    /// new image takes effect. Implies --rebuild. (docker run only reuses a
+    /// cached image otherwise; compose up/--build won't re-pull on its own.)
+    #[arg(long = "pull", conflicts_with = "no_rebuild")]
+    pull: bool,
+
     /// Print version (a lowercase alias for the default -V/--version)
     #[arg(short = 'v', action = clap::ArgAction::Version)]
     version_alias: Option<bool>,
@@ -141,14 +147,16 @@ fn main() {
 
     // 3. Ensure it's up (prompting if needed), rebuilt if the stack drifted,
     //    and postCreate has run once.
-    let rebuild = if cli.rebuild {
+    // --pull forces a recreate: a freshly pulled image only takes effect on a
+    // new container, so a bare pull with no rebuild would be a no-op.
+    let rebuild = if cli.rebuild || cli.pull {
         lifecycle::Rebuild::Force
     } else if cli.no_rebuild {
         lifecycle::Rebuild::Never
     } else {
         lifecycle::Rebuild::Auto
     };
-    let container = match lifecycle::ensure_up(&dc, existing, cli.yes, rebuild) {
+    let container = match lifecycle::ensure_up(&dc, existing, cli.yes, rebuild, cli.pull) {
         Ok(Some(c)) => c,
         Ok(None) => {
             // User declined to start the stack — bow out to the shell quietly.
