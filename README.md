@@ -68,7 +68,7 @@ a couple of environment knobs:
 Update in place any time:
 
 ```sh
-devcon self-update
+devcon self update
 ```
 
 ## Requirements
@@ -91,7 +91,7 @@ devcon ls             List dev-container projects on this host
 devcon ls --all       …including every compose project, not just dev containers
 devcon down           Stop this project's stack (compose down / remove container)
 devcon down --stop    Stop but keep the container(s) for a fast reconnect
-devcon self-update    Update to the latest release
+devcon self update    Update to the latest release
 devcon --help         Show help
 ```
 

@@ -15,6 +15,7 @@ mod docker;
 mod lifecycle;
 mod self_update;
 mod shell;
+mod uninstall;
 mod workspace;
 
 use clap::{Parser, Subcommand};
@@ -70,16 +71,45 @@ enum Commands {
         #[arg(short = 's', long = "stop")]
         stop: bool,
     },
-    /// Update devcon to the latest version
-    #[command(name = "self-update")]
+    /// Manage the devcon installation itself
+    #[command(name = "self", subcommand)]
+    Selfcmd(SelfAction),
+    /// Deprecated: use `devcon self update`
+    #[command(name = "self-update", hide = true)]
     SelfUpdate,
+}
+
+/// devcon's own lifecycle, grouped rustup-style to match `spot` and `tmosh`:
+/// updating and uninstalling are actions, not modifiers on the primary one.
+#[derive(Subcommand, Debug)]
+enum SelfAction {
+    /// Check for and install the latest release
+    Update,
+    /// Remove the devcon binary from this machine
+    Uninstall {
+        /// Show what would be removed without changing anything
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Selfcmd(action)) => {
+            match action {
+                SelfAction::Update => self_update::run().unwrap_or_else(|e| fail(&e.to_string())),
+                SelfAction::Uninstall { dry_run } => {
+                    std::process::exit(uninstall::run(dry_run));
+                }
+            }
+            return;
+        }
+        // Kept as a hidden alias: shipped since v0.2.0, so scripts and muscle
+        // memory in the wild still use it.
         Some(Commands::SelfUpdate) => {
+            eprintln!("devcon: `self-update` is deprecated; use `devcon self update`");
             self_update::run().unwrap_or_else(|e| fail(&e.to_string()));
             return;
         }
