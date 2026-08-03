@@ -46,8 +46,36 @@ pub struct Devcontainer {
     /// `postStartCommand`, normalized. Runs once per container *start* (so it
     /// re-runs after a restart, but not on mere re-connects).
     pub post_start: Vec<LifecycleCommand>,
+    /// `forwardPorts`, normalized. Relayed from the host into the container by
+    /// [`crate::forward`] — *not* published by Docker. See [`PortForward`].
+    pub forward_ports: Vec<PortForward>,
+    /// `appPort`, normalized to `(host_port, container_port)` pairs. Unlike
+    /// `forwardPorts` this one really is Docker publishing, so it becomes `-p`
+    /// flags on `docker run`.
+    pub app_ports: Vec<(u16, u16)>,
     /// `name`, purely informational.
     pub name: Option<String>,
+}
+
+/// One `forwardPorts` entry, normalized.
+///
+/// The spec's mechanism here is a *relay*, not a Docker publish: the tooling
+/// listens on the host and pipes each connection into the container, which then
+/// dials `target_host:container_port` from inside its own network namespace.
+/// Two consequences the publish route can't give you: the app sees the
+/// connection as coming from `localhost` (so binding `127.0.0.1` is fine), and
+/// `target_host` can name a *sibling compose service* (`"db:5432"`), resolved by
+/// compose's DNS rather than by anything on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForward {
+    /// Where to dial *from inside the container* — `"localhost"`, or a compose
+    /// service name for the `"service:port"` form.
+    pub target_host: String,
+    /// The port to dial on `target_host`.
+    pub container_port: u16,
+    /// The host port we'd like to listen on. Only a preference: if it's taken,
+    /// [`crate::forward`] shifts to a free one and reports the real mapping.
+    pub desired_host_port: u16,
 }
 
 /// A single lifecycle command (`postCreateCommand` / `postStartCommand`). The
@@ -136,6 +164,8 @@ impl Devcontainer {
             update_remote_user_uid: parsed.update_remote_user_uid,
             post_create: parsed.post_create_command.into_commands(),
             post_start: parsed.post_start_command.into_commands(),
+            forward_ports: parse_forward_ports(&parsed.forward_ports),
+            app_ports: parse_app_ports(&parsed.app_port.into_entries()),
             name: parsed.name,
         })
     }
@@ -232,6 +262,10 @@ struct Raw {
     post_create_command: CommandField,
     #[serde(default, rename = "postStartCommand")]
     post_start_command: CommandField,
+    #[serde(default, rename = "forwardPorts")]
+    forward_ports: Vec<PortEntry>,
+    #[serde(default, rename = "appPort")]
+    app_port: PortField,
     /// Modern form: `"build": { "dockerfile": "Dockerfile", ... }`.
     #[serde(default)]
     build: Option<Build>,
@@ -318,6 +352,159 @@ impl CommandField {
                 .collect(),
         }
     }
+}
+
+/// A single port entry: `3000` or `"db:5432"`. Both `forwardPorts` and
+/// `appPort` accept either, though they read the string form differently.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum PortEntry {
+    Num(u32),
+    Str(String),
+}
+
+/// `appPort` is a port, a string, or an array of either.
+#[derive(Deserialize, Default)]
+#[serde(untagged)]
+enum PortField {
+    #[default]
+    None,
+    One(PortEntry),
+    Many(Vec<PortEntry>),
+}
+
+impl PortField {
+    fn into_entries(self) -> Vec<PortEntry> {
+        match self {
+            PortField::None => Vec::new(),
+            PortField::One(e) => vec![e],
+            PortField::Many(v) => v,
+        }
+    }
+}
+
+/// Complain about an entry we can't make sense of, and move on. A typo in a
+/// port list must never stop someone getting a shell.
+fn skip_port(field: &str, shown: &str, why: &str) {
+    eprintln!("\x1b[33mdevcon:\x1b[0m ignoring {field} entry {shown}: {why}");
+}
+
+/// Render an entry the way the user wrote it, for diagnostics.
+fn show_entry(entry: &PortEntry) -> String {
+    match entry {
+        PortEntry::Num(n) => n.to_string(),
+        PortEntry::Str(s) => format!("\"{s}\""),
+    }
+}
+
+fn as_port(raw: &str) -> Option<u16> {
+    raw.parse::<u16>().ok().filter(|p| *p != 0)
+}
+
+/// Normalize `forwardPorts` into [`PortForward`]s.
+///
+/// Per the spec the string form is `"host:port"`, where the host is resolved
+/// *inside* the container — that's how `"db:5432"` reaches a sibling compose
+/// service. We make one pragmatic exception: a numeric left-hand side
+/// (`"8080:80"`) is read as `hostPort:containerPort`, since that's Docker's
+/// syntax and what someone writing it almost certainly meant. A compose service
+/// named `8080` would be misread, which we judge to be worth the trade.
+fn parse_forward_ports(entries: &[PortEntry]) -> Vec<PortForward> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let shown = show_entry(entry);
+        let parsed = match entry {
+            PortEntry::Num(n) => match u16::try_from(*n).ok().filter(|p| *p != 0) {
+                Some(port) => Some(PortForward {
+                    target_host: "localhost".into(),
+                    container_port: port,
+                    desired_host_port: port,
+                }),
+                None => {
+                    skip_port("forwardPorts", &shown, "not a valid port number");
+                    None
+                }
+            },
+            PortEntry::Str(s) => parse_forward_string(s.trim()),
+        };
+        match parsed {
+            Some(pf) => out.push(pf),
+            None => {
+                if matches!(entry, PortEntry::Str(_)) {
+                    skip_port(
+                        "forwardPorts",
+                        &shown,
+                        "expected a port, \"port\", or \"host:port\"",
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_forward_string(raw: &str) -> Option<PortForward> {
+    // Bare "3000".
+    if let Some(port) = as_port(raw) {
+        return Some(PortForward {
+            target_host: "localhost".into(),
+            container_port: port,
+            desired_host_port: port,
+        });
+    }
+    // "host:port" — rsplit so an IPv6-ish or dotted host keeps its colons out
+    // of the port.
+    let (left, right) = raw.rsplit_once(':')?;
+    let port = as_port(right)?;
+    if left.is_empty() {
+        return None;
+    }
+    match as_port(left) {
+        // Numeric left side: Docker's hostPort:containerPort.
+        Some(host_port) => Some(PortForward {
+            target_host: "localhost".into(),
+            container_port: port,
+            desired_host_port: host_port,
+        }),
+        // Named left side: a host to dial from inside the container.
+        None => Some(PortForward {
+            target_host: left.to_string(),
+            container_port: port,
+            desired_host_port: port,
+        }),
+    }
+}
+
+/// Normalize `appPort` into `(host_port, container_port)` pairs. This field is
+/// literal Docker publishing, so the string form is `"hostPort:containerPort"`
+/// and a bare number means the same port on both sides.
+fn parse_app_ports(entries: &[PortEntry]) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let shown = show_entry(entry);
+        let parsed = match entry {
+            PortEntry::Num(n) => u16::try_from(*n).ok().filter(|p| *p != 0).map(|p| (p, p)),
+            PortEntry::Str(s) => {
+                let s = s.trim();
+                match s.rsplit_once(':') {
+                    Some((left, right)) => match (as_port(left), as_port(right)) {
+                        (Some(h), Some(c)) => Some((h, c)),
+                        _ => None,
+                    },
+                    None => as_port(s).map(|p| (p, p)),
+                }
+            }
+        };
+        match parsed {
+            Some(pair) => out.push(pair),
+            None => skip_port(
+                "appPort",
+                &shown,
+                "expected a port or \"hostPort:containerPort\"",
+            ),
+        }
+    }
+    out
 }
 
 /// Strip `//` line comments and `/* */` block comments from JSONC, preserving
@@ -610,6 +797,99 @@ mod tests {
         );
         let dc = Devcontainer::load(tmp.path()).unwrap();
         assert!(!dc.update_remote_user_uid);
+    }
+
+    #[test]
+    fn parses_forward_ports_number_and_string_forms() {
+        let tmp = TempDir::new().unwrap();
+        write_dc(
+            tmp.path(),
+            r#"{ "image": "x", "forwardPorts": [3000, "5173", "db:5432", "8080:80"] }"#,
+        );
+        let dc = Devcontainer::load(tmp.path()).unwrap();
+        assert_eq!(
+            dc.forward_ports,
+            vec![
+                PortForward {
+                    target_host: "localhost".into(),
+                    container_port: 3000,
+                    desired_host_port: 3000
+                },
+                PortForward {
+                    target_host: "localhost".into(),
+                    container_port: 5173,
+                    desired_host_port: 5173
+                },
+                // Named left side → a host dialled from inside the container.
+                PortForward {
+                    target_host: "db".into(),
+                    container_port: 5432,
+                    desired_host_port: 5432
+                },
+                // Numeric left side → Docker's hostPort:containerPort.
+                PortForward {
+                    target_host: "localhost".into(),
+                    container_port: 80,
+                    desired_host_port: 8080
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn forward_ports_absent_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        write_dc(tmp.path(), r#"{ "image": "x" }"#);
+        let dc = Devcontainer::load(tmp.path()).unwrap();
+        assert!(dc.forward_ports.is_empty());
+        assert!(dc.app_ports.is_empty());
+    }
+
+    #[test]
+    fn malformed_forward_ports_are_skipped_not_fatal() {
+        let tmp = TempDir::new().unwrap();
+        write_dc(
+            tmp.path(),
+            r#"{ "image": "x", "forwardPorts": [3000, "nonsense", 99999, 0, "db:"] }"#,
+        );
+        let dc = Devcontainer::load(tmp.path()).unwrap();
+        assert_eq!(dc.forward_ports.len(), 1);
+        assert_eq!(dc.forward_ports[0].container_port, 3000);
+    }
+
+    #[test]
+    fn parses_app_port_all_three_shapes() {
+        for (json, expected) in [
+            (r#"{ "image": "x", "appPort": 8080 }"#, vec![(8080, 8080)]),
+            (
+                r#"{ "image": "x", "appPort": "8080:80" }"#,
+                vec![(8080, 80)],
+            ),
+            (
+                r#"{ "image": "x", "appPort": [3000, "5432:5432"] }"#,
+                vec![(3000, 3000), (5432, 5432)],
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write_dc(tmp.path(), json);
+            let dc = Devcontainer::load(tmp.path()).unwrap();
+            assert_eq!(dc.app_ports, expected, "for {json}");
+        }
+    }
+
+    #[test]
+    fn app_port_and_forward_ports_do_not_share_string_semantics() {
+        // The same "8080:80" is a publish mapping for appPort and (by our
+        // numeric-left-side rule) the same mapping for forwardPorts — but
+        // "db:5432" is only meaningful for forwardPorts.
+        let tmp = TempDir::new().unwrap();
+        write_dc(
+            tmp.path(),
+            r#"{ "image": "x", "appPort": "db:5432", "forwardPorts": ["db:5432"] }"#,
+        );
+        let dc = Devcontainer::load(tmp.path()).unwrap();
+        assert!(dc.app_ports.is_empty(), "appPort has no host form");
+        assert_eq!(dc.forward_ports[0].target_host, "db");
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod config;
 mod connect;
 mod devcontainer;
 mod docker;
+mod forward;
 mod lifecycle;
 mod self_update;
 mod shell;
@@ -77,6 +78,19 @@ enum Commands {
         #[arg(short = 's', long = "stop")]
         stop: bool,
     },
+    /// Relay this project's `forwardPorts` from the host into the container
+    #[command(name = "forward")]
+    Forward {
+        /// Show the ports a running relay has already bound, and exit
+        #[arg(short = 'l', long = "list")]
+        list: bool,
+        /// Stop this project's relay
+        #[arg(long = "stop", conflicts_with = "list")]
+        stop: bool,
+        /// Internal: run as the background relay started by `devcon` itself
+        #[arg(long = "detached", hide = true, conflicts_with_all = ["list", "stop"])]
+        detached: bool,
+    },
     /// Manage the devcon installation itself
     #[command(name = "self", subcommand)]
     Selfcmd(SelfAction),
@@ -127,6 +141,14 @@ fn main() {
             down_stack(stop);
             return;
         }
+        Some(Commands::Forward {
+            list,
+            stop,
+            detached,
+        }) => {
+            forward_ports(list, stop, detached);
+            return;
+        }
         None => {}
     }
 
@@ -168,6 +190,10 @@ fn main() {
 
     // 4. Resolve the workspace dir (inspect > expanded json > convention).
     let workdir = workspace::resolve(&dc, &container);
+
+    // 4b. Start the forwardPorts relay before we exec — once the shell replaces
+    //     this process there's nobody left to start it.
+    forward::ensure_running(&dc, &container);
 
     // 5. Resolve the shell (flag > config > detect > prompt+persist).
     let cfg = config::Config::load(&project_root);
@@ -250,16 +276,48 @@ fn list_projects(all: bool) {
     }
 }
 
-/// Handle `devcon down [--stop]`: locate the current project and tear its
-/// stack down (remove by default, or just stop with `--stop`).
-fn down_stack(stop: bool) {
+/// Locate the project around the cwd and parse its devcontainer.json, or exit.
+fn load_project() -> Devcontainer {
     let cwd = std::env::current_dir()
         .unwrap_or_else(|e| fail(&format!("cannot determine current directory: {e}")));
     let project_root = devcontainer::find_project_root(&cwd).unwrap_or_else(|| {
         eprintln!("error: no .devcontainer folder found in {cwd:?} or any parent directory");
         std::process::exit(1);
     });
-    let dc = Devcontainer::load(&project_root).unwrap_or_else(|e| fail(&e.to_string()));
+    Devcontainer::load(&project_root).unwrap_or_else(|e| fail(&e.to_string()))
+}
+
+/// Handle `devcon forward`: relay the declared `forwardPorts` in the
+/// foreground, list what a running relay bound, or stop it.
+fn forward_ports(list: bool, stop: bool, _detached: bool) {
+    let dc = load_project();
+
+    if list {
+        forward::list(&dc);
+        return;
+    }
+    if stop {
+        forward::stop(&dc);
+        return;
+    }
+
+    let container = docker::find(&dc)
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("the dev container isn't running — start it with `devcon` first"));
+
+    // A relay already holding these ports would just lose the race to bind, so
+    // clear it out and take over rather than half-forwarding.
+    forward::stop(&dc);
+    forward::run(&dc, &container).unwrap_or_else(|e| fail(&e.to_string()));
+}
+
+/// Handle `devcon down [--stop]`: locate the current project and tear its
+/// stack down (remove by default, or just stop with `--stop`).
+fn down_stack(stop: bool) {
+    let dc = load_project();
+    // The relay outlives a single `devcon` invocation, so taking the stack down
+    // has to take it with them — otherwise it sits accepting into nothing.
+    forward::stop(&dc);
     let existing = docker::find(&dc).unwrap_or_else(|e| fail(&e.to_string()));
 
     let mode = if stop {
