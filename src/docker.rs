@@ -496,6 +496,15 @@ pub fn exec_status(
         .map_err(map_spawn_err)
 }
 
+/// Is this container still running? Used by the port-forward watchdog, which
+/// must not outlive the container it relays into. Any failure to ask (docker
+/// gone, container removed) counts as "no".
+pub fn container_running(container: &Container) -> bool {
+    run_docker(&["inspect", "-f", "{{.State.Running}}", &container.id])
+        .map(|out| String::from_utf8_lossy(&out).trim() == "true")
+        .unwrap_or(false)
+}
+
 /// A dev-container project discovered on this host by scanning containers.
 /// One project may span several containers (a compose stack: app + sidecars).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,6 +840,8 @@ mod tests {
             update_remote_user_uid: true,
             post_create: vec![],
             post_start: vec![],
+            forward_ports: vec![],
+            app_ports: vec![],
             name: None,
         }
     }

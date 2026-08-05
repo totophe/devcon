@@ -53,7 +53,9 @@ Run `devcon` at a project root:
    compose file, or the Dockerfile) since the container was built, asks
    `Rebuild it? [y/N]` and recreates it (see [Rebuilding](#rebuilding)).
 6. Resolves the container-side workspace directory (`docker exec -w`).
-7. Resolves which shell to use, then `exec`s `docker exec -it -w … <shell>`.
+7. Starts the `forwardPorts` relay, if the config declares any
+   (see [Port forwarding](#port-forwarding)).
+8. Resolves which shell to use, then `exec`s `docker exec -it -w … <shell>`.
 
 ## Install
 
@@ -91,6 +93,9 @@ devcon ls             List dev-container projects on this host
 devcon ls --all       …including every compose project, not just dev containers
 devcon down           Stop this project's stack (compose down / remove container)
 devcon down --stop    Stop but keep the container(s) for a fast reconnect
+devcon forward        Relay this project's forwardPorts in the foreground
+devcon forward --list Show the ports currently being forwarded
+devcon forward --stop Stop this project's relay
 devcon self update    Update to the latest release
 devcon --help         Show help
 ```
@@ -134,6 +139,79 @@ Hooks run as the declared `remoteUser` (if that user exists in the container —
 see below) in the resolved workspace folder. The wellmade scripts are
 idempotent anyway, so the markers are an optimization, not a correctness
 crutch.
+
+## Port forwarding
+
+`devcon` honors `forwardPorts`. It does it the way VS Code does — as a **relay**,
+not a Docker publish:
+
+```jsonc
+{
+  "image": "ghcr.io/example/dev:latest",
+  "forwardPorts": [3000, "5173", "db:5432"]
+}
+```
+
+Connect, and the ports are there:
+
+```
+devcon: forwarding localhost:3000 → 3000
+devcon: forwarding localhost:5173 → 5173
+devcon: forwarding localhost:5432 → db:5432
+```
+
+Docker is never told about these ports. `devcon` listens on `127.0.0.1:<port>`
+and, per connection, runs a small helper inside the container that dials the
+target from the container's own network namespace and pipes bytes back. Three
+things follow from that:
+
+- **Your app can bind `127.0.0.1`.** The connection reaches it from inside, as
+  `localhost`. This is the case a published port cannot serve.
+- **`"db:5432"` works.** The name is resolved inside the container, so it can
+  name a sibling compose service. Compose stacks need no special handling.
+- **A busy host port is not fatal.** If `3000` is taken, `devcon` shifts to the
+  next free port and says so: `forwarding localhost:3001 → 3000 (3000 was busy)`.
+
+### Lifetime
+
+The relay is a background process, because `devcon` `exec`s your shell and
+leaves nothing of itself behind. It outlives the shell and stops when the
+container does. `devcon down` stops it too. If it dies for any other reason the
+next `devcon` notices and starts a fresh one. Inspect or manage it directly with
+`devcon forward --list` / `--stop`, or run `devcon forward` to watch it in the
+foreground.
+
+### The in-container helper
+
+Opening a connection from inside the container needs *something* in the image to
+do it. `devcon` probes for `socat`, `python3`, `ncat`, `nc`, then `bash`
+(via `/dev/tcp`), in that order, and uses the first it finds. If none is present
+it says so and forwarding is skipped — you still get your shell.
+
+The order is not about speed. `socat` and `python3` propagate a client's
+half-close, so the target sees end-of-request; `nc` only manages it on some
+flavours, and `bash` cannot at all. That matters solely for protocols where the
+server reads until EOF before replying — HTTP, dev servers and databases all
+answer without waiting. When a fallback helper is chosen, `devcon` warns. The
+fix is one line in the image:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends socat
+```
+
+### `appPort`
+
+`appPort` is the one port field in the spec that really does mean Docker
+publishing, so `devcon` translates it into `-p` flags on `docker run`:
+
+```jsonc
+{ "image": "…", "appPort": ["8080:80"] }
+```
+
+Because it is a real publish, your app must listen on `0.0.0.0` for it to work —
+and it cannot be applied to a compose stack from the command line, so declare
+`ports:` in your compose file instead (`devcon` warns if you don't). Prefer
+`forwardPorts` unless you specifically need the port published.
 
 ## Stopping a stack
 
@@ -268,6 +346,10 @@ project path, same rule as `dcon`:
 
 ## Roadmap
 
+- **A bundled forwarding helper** — ship a static relay binary and `docker cp`
+  it in, the way VS Code does with its server. That would drop the image
+  requirement in [Port forwarding](#port-forwarding) and give every image proper
+  half-close handling, instead of depending on what happens to be installed.
 - **zellij workspace mode** — a `--workspace` flag that execs
   `zellij attach -c <codename>` instead of a bare shell, completing the
   `tmux → docker → zellij` vision. Parked; the machinery is already in place

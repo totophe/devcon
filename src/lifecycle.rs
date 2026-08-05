@@ -515,6 +515,16 @@ fn compose_up_args(
 
 fn bring_up_compose(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
     eprintln!("\x1b[36mdevcon:\x1b[0m starting compose stack…");
+    // `docker compose up` takes no port mappings on the command line, so the
+    // only way to publish here is the compose file itself. (forwardPorts needs
+    // no such caveat — the relay works the same on both stack types.)
+    if !dc.app_ports.is_empty() {
+        eprintln!(
+            "\x1b[33mdevcon:\x1b[0m appPort is ignored on compose stacks — \
+             declare `ports:` on the {} service instead.",
+            dc.service.as_deref().unwrap_or("dev")
+        );
+    }
     let compose_dir = dc.project_root.join(".devcontainer");
     let args = compose_up_args(dc, false, false, pull);
 
@@ -545,17 +555,9 @@ fn pull_image(image: &str) {
     }
 }
 
-fn bring_up_image(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
-    let image = dc.image.as_deref().ok_or_else(|| {
-        Error::BringUpFailed("no image or dockerComposeFile in devcontainer.json".into())
-    })?;
-
-    if pull {
-        pull_image(image);
-    }
-
-    eprintln!("\x1b[36mdevcon:\x1b[0m starting container from {image}…");
-
+/// The `docker run …` argument vector for an image-based stack. Pure so the
+/// flag order stays pinned by tests, like [`compose_up_args`].
+fn run_args(dc: &Devcontainer, image: &str) -> Vec<String> {
     let workspace = dc.resolved_workspace_folder();
     let project_root = dc.project_root.to_string_lossy().into_owned();
     let codename = crate::codename::derive(&dc.project_root);
@@ -579,6 +581,13 @@ fn bring_up_image(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
     // written only after postCreate runs (see docker::has_marker).
     args.push("--label".into());
     args.push(format!("{}=1", docker::MARKER_LABEL));
+    // `appPort` is the one port field that genuinely means "publish" — the spec
+    // even warns the app must listen on 0.0.0.0 for it to work. `forwardPorts`
+    // is deliberately absent here: it's a relay, handled by crate::forward.
+    for (host, container) in &dc.app_ports {
+        args.push("-p".into());
+        args.push(format!("{host}:{container}"));
+    }
     // Run PID 1 as the declared user only when we're NOT about to remap that
     // user's uid to the host's — usermod can't renumber a user that already has
     // a live process. When remapping, PID 1 stays root and the shell/hooks exec
@@ -593,6 +602,21 @@ fn bring_up_image(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
     // Keep the container alive; the shell comes later via `docker exec`.
     args.push("sleep".into());
     args.push("infinity".into());
+    args
+}
+
+fn bring_up_image(dc: &Devcontainer, pull: bool) -> Result<(), Error> {
+    let image = dc.image.as_deref().ok_or_else(|| {
+        Error::BringUpFailed("no image or dockerComposeFile in devcontainer.json".into())
+    })?;
+
+    if pull {
+        pull_image(image);
+    }
+
+    eprintln!("\x1b[36mdevcon:\x1b[0m starting container from {image}…");
+
+    let args = run_args(dc, image);
 
     let status = Command::new("docker")
         .args(&args)
@@ -974,9 +998,21 @@ impl std::fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_up_args, compose_up_services, parse_rfc3339_secs, post_start_sentinel};
+    use super::{
+        compose_up_args, compose_up_services, parse_rfc3339_secs, post_start_sentinel, run_args,
+    };
     use crate::devcontainer::Devcontainer;
     use std::path::PathBuf;
+
+    /// An image-based `Devcontainer` publishing the given `appPort` pairs.
+    fn image_dc(app_ports: &[(u16, u16)]) -> Devcontainer {
+        let mut dc = compose_dc(None, &[]);
+        dc.compose_files = vec![];
+        dc.image = Some("img:latest".into());
+        dc.workspace_folder = Some("/workspaces/proj".into());
+        dc.app_ports = app_ports.to_vec();
+        dc
+    }
 
     /// A compose-based `Devcontainer` with the given `service` / `runServices`.
     fn compose_dc(service: Option<&str>, run_services: &[&str]) -> Devcontainer {
@@ -994,6 +1030,8 @@ mod tests {
             update_remote_user_uid: true,
             post_create: vec![],
             post_start: vec![],
+            forward_ports: vec![],
+            app_ports: vec![],
             name: None,
         }
     }
@@ -1018,6 +1056,46 @@ mod tests {
         // Primary already present → don't append it twice.
         let dc = compose_dc(Some("app"), &["app", "db"]);
         assert_eq!(compose_up_services(&dc), vec!["app", "db"]);
+    }
+
+    #[test]
+    fn run_args_without_app_port_publishes_nothing() {
+        let args = run_args(&image_dc(&[]), "img:latest");
+        assert!(!args.iter().any(|a| a == "-p"), "got {args:?}");
+        assert!(args.ends_with(&[
+            "img:latest".to_string(),
+            "sleep".to_string(),
+            "infinity".to_string()
+        ]));
+    }
+
+    #[test]
+    fn run_args_publishes_each_app_port_before_the_image() {
+        let args = run_args(&image_dc(&[(8080, 80), (5432, 5432)]), "img:latest");
+        let pairs: Vec<&String> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(flag, _)| *flag == "-p")
+            .map(|(_, val)| val)
+            .collect();
+        assert_eq!(pairs, vec!["8080:80", "5432:5432"]);
+        // Flags must precede the image; anything after it is the container cmd.
+        let image_at = args.iter().position(|a| a == "img:latest").unwrap();
+        let last_p = args.iter().rposition(|a| a == "-p").unwrap();
+        assert!(last_p < image_at, "publish flags after the image: {args:?}");
+    }
+
+    #[test]
+    fn run_args_never_publishes_forward_ports() {
+        // forwardPorts is a relay, not a publish — it must not leak into argv.
+        let mut dc = image_dc(&[]);
+        dc.forward_ports = vec![crate::devcontainer::PortForward {
+            target_host: "localhost".into(),
+            container_port: 3000,
+            desired_host_port: 3000,
+        }];
+        let args = run_args(&dc, "img:latest");
+        assert!(!args.iter().any(|a| a == "-p" || a.contains("3000")));
     }
 
     #[test]
